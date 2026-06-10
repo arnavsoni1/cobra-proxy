@@ -1,0 +1,78 @@
+digraph {
+
+    graph [
+        label="proxy",
+        labelloc=t,
+
+        pad=0.4,
+
+        // Consider rendering the graph using a different layout algorithm, such as:
+        // [dot, neato, twopi, circo, fdp, sfdp]
+        layout=neato,
+        overlap=false,
+        splines="line",
+        rankdir=LR,
+
+        fontname="Helvetica", 
+        fontsize="36",
+    ];
+
+    node [
+        fontname="monospace",
+        fontsize="10",
+        shape="record",
+        style="filled",
+    ];
+
+    edge [
+        fontname="monospace",
+        fontsize="10",
+    ];
+
+    "proxy" [label="crate|proxy", fillcolor="#5397c8"]; // "crate" node
+    "proxy::Bridge" [label="pub struct|Bridge", fillcolor="#81c169"]; // "struct" node
+    "proxy::Bridge::handle_connect" [label="pub(crate) async fn|Bridge::handle_connect", fillcolor="#f8c04c"]; // "async fn" node
+    "proxy::Bridge::new" [label="pub fn|Bridge::new", fillcolor="#81c169"]; // "fn" node
+    "proxy::Bridge::run_bridge" [label="pub async fn|Bridge::run_bridge", fillcolor="#81c169"]; // "async fn" node
+    "proxy::Proxy" [label="pub struct|Proxy", fillcolor="#81c169"]; // "struct" node
+    "proxy::Proxy::CTX" [label="pub(crate) type|Proxy::CTX", fillcolor="#f8c04c"]; // "type" node
+    "proxy::Proxy::cache_key_callback" [label="pub(crate) fn|Proxy::cache_key_callback", fillcolor="#f8c04c"]; // "fn" node
+    "proxy::Proxy::extract_id" [label="pub(crate) fn|Proxy::extract_id", fillcolor="#f8c04c"]; // "fn" node
+    "proxy::Proxy::new_ctx" [label="pub(crate) fn|Proxy::new_ctx", fillcolor="#f8c04c"]; // "fn" node
+    "proxy::Proxy::request_cache_filter" [label="pub(crate) fn|Proxy::request_cache_filter", fillcolor="#f8c04c"]; // "fn" node
+    "proxy::Proxy::request_filter" [label="pub(crate) async fn|Proxy::request_filter", fillcolor="#f8c04c"]; // "async fn" node
+    "proxy::Proxy::response_filter" [label="pub(crate) async fn|Proxy::response_filter", fillcolor="#f8c04c"]; // "async fn" node
+    "proxy::Proxy::upstream_peer" [label="pub(crate) async fn|Proxy::upstream_peer", fillcolor="#f8c04c"]; // "async fn" node
+    "proxy::Proxy::upstream_request_filter" [label="pub(crate) async fn|Proxy::upstream_request_filter", fillcolor="#f8c04c"]; // "async fn" node
+    "proxy::RequestCtx" [label="pub struct|RequestCtx", fillcolor="#81c169"]; // "struct" node
+    "proxy::cache" [label="pub(crate) fn|cache", fillcolor="#f8c04c"]; // "fn" node
+    "proxy::main" [label="pub(crate) fn|main", fillcolor="#f8c04c"]; // "fn" node
+
+    "proxy" -> "proxy::Bridge" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy" -> "proxy::Proxy" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy" -> "proxy::RequestCtx" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy" -> "proxy::cache" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy" -> "proxy::main" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Bridge" -> "proxy::Bridge::handle_connect" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Bridge" -> "proxy::Bridge::new" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Bridge" -> "proxy::Bridge::run_bridge" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Bridge::new" -> "proxy::Bridge" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy" -> "proxy::Proxy::CTX" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::cache_key_callback" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::extract_id" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::new_ctx" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::request_cache_filter" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::request_filter" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::response_filter" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::upstream_peer" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy" -> "proxy::Proxy::upstream_request_filter" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "proxy::Proxy::CTX" -> "proxy::RequestCtx" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::cache_key_callback" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::new_ctx" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::request_cache_filter" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::request_filter" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::response_filter" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::upstream_peer" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "proxy::Proxy::upstream_request_filter" -> "proxy::Proxy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+
+}

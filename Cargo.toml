@@ -1,0 +1,14 @@
+[package]
+name = "proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+arti-client = "0.42.0"
+async-trait = "0.1.89"
+http = "1.4.0"
+pingora = { version = "0.8.0", features = ["proxy", "cache"] }
+pingora-memory-cache = "0.8.0"
+tokio = "1.52.3"
+tor-rtcompat = "0.42.0"
