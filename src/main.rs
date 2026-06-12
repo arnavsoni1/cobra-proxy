@@ -215,6 +215,9 @@ impl Bridge {
 		tor: TorClient<PreferredRuntime>,
 		token_store: Arc<MemoryCache<String, IsolationToken>>
 	) -> anyhow::Result<()> {
+		let (reader, mut writer) = io::split(stream);
+		let mut reader = BufReader::new(reader);
+		
 		Ok(()) //for now
 	}
 }
