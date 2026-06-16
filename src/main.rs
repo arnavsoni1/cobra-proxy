@@ -2,7 +2,7 @@ use pingora::{
 	prelude::*, 
 	cache::{
 		MemCache, HttpCache, CacheMeta, Storage, 
-		//trace::SpanHandle,
+		trace::SpanHandle,
 		CacheKey
 	},
 	protocols::http::ServerSession,
@@ -28,7 +28,8 @@ use tor_rtcompat::PreferredRuntime;
 use tokio::{
 	io::{self, AsyncReadExt, AsyncWriteExt, BufReader},
 	runtime::Runtime, 
-	net::{TcpListener, TcpStream}
+	net::{TcpListener, TcpStream},
+	time::Duration
 };
 //use anyhow::*;
 
@@ -62,6 +63,26 @@ impl Proxy {
 			.map(|val| val.to_string())
             .ok_or("Error: No ID found".to_string())
     }
+}
+
+trait BridgeSession {
+	fn finish(
+		&self,
+		storage: &'static (dyn Storage + Sync),
+		trace: SpanHandle,
+		session: &mut Session,
+		token: IsolationToken
+	) -> Result<()>;
+	
+	fn persist_token(
+        &self,
+        storage: &'static (dyn Storage + Sync),
+        key: &str,
+        token: IsolationToken,
+        ttl: Option<Duration>,
+    ) -> Result<()>;
+	
+	
 }
 
 #[async_trait]
@@ -221,6 +242,11 @@ impl Bridge {
 		Ok(()) //for now
 	}
 }
+
+//impl BridgeSession for Bridge {
+//	fn finish()
+//	fn persist_token()
+//}
 
 //#[tokio::main]
 fn main() -> Result<()> {
