@@ -15,7 +15,8 @@ use std::{
 	sync::{
 		atomic::{AtomicUsize, Ordering},
 		Arc, OnceLock
-	}
+	},
+	marker::PhantomData
 	//error::Error
 };
 use pingora_memory_cache::MemoryCache; 
@@ -50,6 +51,11 @@ pub struct RequestCtx{
 	token: IsolationToken,
 }
 
+pub struct CircuitHandle<'session> {
+	token: IsolationToken,
+	lifetime: PhantomData<'session ()>
+}
+
 #[derive(Clone)]
 pub struct Bridge{
 	tor: Arc<TorClient<PreferredRuntime>>,
@@ -82,6 +88,11 @@ trait BridgeSession {
         ttl: Option<Duration>,
     ) -> Result<()>;
 	
+	fn rotate_token(
+        &self,
+        storage: &'static (dyn Storage + Sync),
+        key: &str,
+    ) -> Result<IsolationToken>;
 	
 }
 
@@ -241,11 +252,23 @@ impl Bridge {
 		
 		Ok(()) //for now
 	}
+	
+	fn open_circuit<'a>(
+		&self,
+		session: &'a mut Session,
+		token: IsolationToken
+	) -> CircuitHandle<'a> {
+		CircuitHandle {
+			token,
+			lifetime: PhantomData
+		}
+	}
 }
 
 //impl BridgeSession for Bridge {
 //	fn finish()
 //	fn persist_token()
+//	fn rotate_token()
 //}
 
 //#[tokio::main]
