@@ -53,7 +53,7 @@ pub struct RequestCtx{
 
 pub struct CircuitHandle<'session> {
 	token: IsolationToken,
-	lifetime: PhantomData<'session ()>
+	lifetime: PhantomData<&'session ()>
 }
 
 #[derive(Clone)]
@@ -113,7 +113,21 @@ impl ProxyHttp for Proxy {
 		session: &mut Session,
 		ctx: &mut Self::CTX
 	) -> Result<Box<HttpPeer>> {
-		let peer = HttpPeer::new("ipinfo.io:80", false, "ipinfo.io".to_string());
+		let host = session
+			.req_header()
+			.headers
+			.get(http::header::HOST)
+			.and_then(|v| v.to_str().ok())
+			.unwrap_or("ipinfo.io");
+		// let peer = HttpPeer::new("ipinfo.io:80", false, "ipinfo.io".to_string());
+		let port = 80;
+		let dest = format!("{host}:{port}");
+		
+		let peer = HttpPeer::new(
+			"127.0.0.1:19050",
+			false, //tls
+			host.to_string()
+		);
 		Ok(Box::new(peer))
 	}
 	
