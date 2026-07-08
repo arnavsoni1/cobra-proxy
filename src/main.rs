@@ -7,7 +7,8 @@ use pingora::{
 	},
 	protocols::http::ServerSession,
 	proxy::{Session, ProxyHttp},
-	Error
+	Error,
+	upstreams::peer::Proxy as CrateProxy,
 };
 use async_trait::async_trait;
 use std::{
@@ -16,21 +17,24 @@ use std::{
 		atomic::{AtomicUsize, Ordering},
 		Arc, OnceLock
 	},
-	marker::PhantomData
+	marker::PhantomData,
+	path::Path
 	//error::Error
 };
 use pingora_memory_cache::MemoryCache; 
 use arti_client::{
 	IsolationToken,
 	//isolation::IsolationHelper,
-	TorClient, TorClientConfig
+	TorClient, TorClientConfig,
+	StreamPrefs
 };
 use tor_rtcompat::PreferredRuntime;
 use tokio::{
-	io::{self, AsyncReadExt, AsyncWriteExt, BufReader},
+	io::{self, AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt},
 	runtime::Runtime, 
 	net::{TcpListener, TcpStream},
 	time::Duration
+	//sync::{Semaphore, SemaphorePermit}
 };
 //use anyhow::*;
 
@@ -51,9 +55,16 @@ pub struct RequestCtx{
 	token: IsolationToken,
 }
 
-pub struct CircuitHandle<'session> {
+//pub struct RateLimitGuard {
+//	semaphore: Arc<Semaphore>, 
+//	permit: SemaphorePermit<'static>
+//}
+
+pub struct CircuitHandle<'session, Phase> {
 	token: IsolationToken,
+	phase: PhantomData<Phase>,
 	lifetime: PhantomData<&'session ()>
+	// guard: RateLimitGuard
 }
 
 #[derive(Clone)]
@@ -123,11 +134,17 @@ impl ProxyHttp for Proxy {
 		let port = 80;
 		let dest = format!("{host}:{port}");
 		
-		let peer = HttpPeer::new(
-			"127.0.0.1:19050",
+		let mut peer = HttpPeer::new(
+			"ipinfo.io:80",
 			false, //tls
 			host.to_string()
 		);
+		peer.proxy = Some(CrateProxy {
+			next_hop: Box::from(Path::new("127.0.0.1:19050")),
+			host: "ipinfo.io".to_string(),  
+			port: 80,                 
+			headers: Default::default()
+		});
 		Ok(Box::new(peer))
 	}
 	
@@ -234,7 +251,7 @@ impl Bridge {
 	}
 	
 	pub async fn run_bridge(
-		tor: TorClient<PreferredRuntime>,
+		tor: Arc<TorClient<PreferredRuntime>>,
 		token_store: Arc<MemoryCache<String, IsolationToken>>
 	) {
 		let addr = "127.0.0.1:19050";
@@ -257,23 +274,70 @@ impl Bridge {
 	}
 	
 	async fn handle_connect(
-		stream: TcpStream,
-		tor: TorClient<PreferredRuntime>,
+		mut stream: TcpStream,
+		tor: Arc<TorClient<PreferredRuntime>>,
 		token_store: Arc<MemoryCache<String, IsolationToken>>
 	) -> anyhow::Result<()> {
-		let (reader, mut writer) = io::split(stream);
-		let mut reader = BufReader::new(reader);
+		//let (reader, mut writer) = io::split(stream);
+		//let mut reader = BufReader::new(reader);
 		
+		let dest = {
+			let mut reader = BufReader::new(&mut stream);
+			let mut line   = String::new();
+			reader.read_line(&mut line).await?;
+
+			let mut header = String::new();
+			loop {
+				reader.read_line(&mut header).await?;
+				if header.trim().is_empty() { break; }
+				header.clear();
+			}
+
+			line.split_whitespace()
+				.nth(1)
+				.ok_or_else(|| anyhow::anyhow!("malformed CONNECT line"))?
+				.to_string()
+		};
+		
+		let token = match token_store.get(&dest) {
+			(Some(t), _) => t,
+			(None,    _) => {
+				let t = IsolationToken::new();
+				token_store.put(&dest, t, None);
+				t
+			}
+		};
+		
+		let temp_dest = "ipinfo.io:80";
+		
+		let mut prefs = StreamPrefs::new();
+		prefs.set_isolation(token);
+		
+		let mut tor_stream = match tor.connect_with_prefs(&temp_dest, &prefs).await {
+			Ok(s)  => {
+				stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+				s
+			}
+			Err(e) => {
+				stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+				anyhow::bail!("tor→{dest}: {e}");
+			}
+		};
+		
+		tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await?;
 		Ok(()) //for now
 	}
-	
-	fn open_circuit<'a>(
+}
+
+impl Bridge {
+	fn open_circuit<'a, Startup>(
 		&self,
 		session: &'a mut Session,
 		token: IsolationToken
-	) -> CircuitHandle<'a> {
+	) -> CircuitHandle<'a, Startup> {
 		CircuitHandle {
 			token,
+			phase: PhantomData,
 			lifetime: PhantomData
 		}
 	}
@@ -309,6 +373,17 @@ fn main() -> Result<()> {
 		Arc::new(client)
 	};
 	
+	let token_store: Arc<MemoryCache<String, IsolationToken>> = Arc::new(MemoryCache::new(10_000));
+	
+	{
+        let tor   = tor_client.clone();
+        let store = token_store.clone();
+        std::thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(Bridge::run_bridge(tor, store));
+        });
+    }
+	
 	let mut server =  match Server::new(None) {
 		Ok(s) => {
 			s
@@ -322,7 +397,7 @@ fn main() -> Result<()> {
 	
 	let mut service = http_proxy_service(&server.configuration, Proxy { 
 		request_counter: 0.into(), 
-		cache: Arc::new(MemoryCache::new(10_000)),
+		cache: token_store.clone(),
 		//isolation_manager: IsolationHelper::new() ### Error, no constructors for traits
 		tor_client: tor_client.clone()
 	});
