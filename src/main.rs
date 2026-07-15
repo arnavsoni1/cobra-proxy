@@ -5,8 +5,9 @@ use pingora::{
 		trace::SpanHandle,
 		CacheKey
 	},
+	apps::HttpServerOptions,
 	protocols::http::ServerSession,
-	proxy::{Session, ProxyHttp},
+	proxy::{Session, ProxyHttp, ProxyServiceBuilder},
 	Error,
 	upstreams::peer::Proxy as CrateProxy,
 };
@@ -26,21 +27,80 @@ use arti_client::{
 	IsolationToken,
 	//isolation::IsolationHelper,
 	TorClient, TorClientConfig,
-	StreamPrefs
+	StreamPrefs, TorAddr
 };
 use tor_rtcompat::PreferredRuntime;
 use tokio::{
-	io::{self, AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt},
+	io::{self, AsyncReadExt, AsyncWriteExt},
 	runtime::Runtime, 
-	net::{TcpListener, TcpStream},
+	net::{TcpListener, TcpStream, UnixListener, UnixStream},
 	time::Duration
 	//sync::{Semaphore, SemaphorePermit}
 };
 //use anyhow::*;
 
 static CACHE: OnceLock<MemCache> = OnceLock::new();
+const MAX_CONNECT_HEADER_BYTES: usize = 16 * 1024;
+const MAX_CONNECT_HEADERS: usize = 64;
+const BRIDGE_SOCKET: &str = "/tmp/proxy-bridge.sock";
+
 fn cache() -> &'static MemCache {
 	CACHE.get_or_init(MemCache::new)
+}
+
+fn parse_connect_request(buffer: &[u8]) -> anyhow::Result<Option<(String, usize)>> {
+	let mut headers = [httparse::EMPTY_HEADER; MAX_CONNECT_HEADERS];
+	let mut request = httparse::Request::new(&mut headers);
+	let httparse::Status::Complete(header_len) = request
+		.parse(buffer)
+		.map_err(|error| anyhow::anyhow!("malformed HTTP request: {error}"))?
+	else {
+		return Ok(None);
+	};
+
+	if header_len > MAX_CONNECT_HEADER_BYTES {
+		anyhow::bail!("CONNECT request headers exceed {MAX_CONNECT_HEADER_BYTES} bytes");
+	}
+	if request.method != Some("CONNECT") {
+		anyhow::bail!("expected CONNECT request");
+	}
+
+	let destination = request
+		.path
+		.filter(|destination| !destination.is_empty())
+		.ok_or_else(|| anyhow::anyhow!("CONNECT request is missing a destination"))?;
+
+	Ok(Some((destination.to_owned(), header_len)))
+}
+
+fn parse_connect_destination(destination: &str) -> anyhow::Result<TorAddr> {
+	TorAddr::from(destination)
+		.map_err(|error| anyhow::anyhow!("invalid CONNECT destination {destination:?}: {error}"))
+}
+
+async fn read_connect_request<S>(stream: &mut S) -> anyhow::Result<(String, Vec<u8>)>
+where
+	S: tokio::io::AsyncRead + Unpin,
+{
+	let mut buffer = Vec::with_capacity(1024);
+	let mut chunk = [0_u8; 1024];
+
+	loop {
+		if let Some((destination, header_len)) = parse_connect_request(&buffer)? {
+			return Ok((destination, buffer[header_len..].to_vec()));
+		}
+		if buffer.len() == MAX_CONNECT_HEADER_BYTES {
+			anyhow::bail!("CONNECT request headers exceed {MAX_CONNECT_HEADER_BYTES} bytes");
+		}
+
+		let remaining = MAX_CONNECT_HEADER_BYTES - buffer.len();
+		let read_capacity = remaining.min(chunk.len());
+		let read = stream.read(&mut chunk[..read_capacity]).await?;
+		if read == 0 {
+			anyhow::bail!("connection closed before a complete CONNECT request was received");
+		}
+		buffer.extend_from_slice(&chunk[..read]);
+	}
 }
 
 pub struct Proxy{
@@ -133,20 +193,22 @@ impl ProxyHttp for Proxy {
 			.headers
 			.get(http::header::HOST)
 			.and_then(|v| v.to_str().ok())
-			.unwrap_or("ipinfo.io");
-		// let peer = HttpPeer::new("ipinfo.io:80", false, "ipinfo.io".to_string());
-		let port = 80;
-		let dest = format!("{host}:{port}");
+			.ok_or_else(|| Error::new(InvalidHTTPHeader))?;
+		let authority = host
+			.parse::<http::uri::Authority>()
+			.map_err(|_| Error::new(InvalidHTTPHeader))?;
+		let host = authority.host().to_owned();
+		let port = authority.port_u16().unwrap_or(80);
 		
 		let mut peer = HttpPeer::new(
-			"ipinfo.io:80",
+			format!("{host}:{port}"),
 			false, //tls
 			host.to_string()
 		);
 		peer.proxy = Some(CrateProxy {
-			next_hop: Box::from(Path::new("127.0.0.1:19050")),
-			host: "ipinfo.io".to_string(),  
-			port: 80,                 
+			next_hop: Box::from(Path::new(BRIDGE_SOCKET)),
+			host,
+			port,
 			headers: Default::default()
 		});
 		Ok(Box::new(peer))
@@ -158,13 +220,6 @@ impl ProxyHttp for Proxy {
 		upstream_request: &mut RequestHeader,
 		ctx: &mut Self::CTX
 	) -> Result<()> {
-		match upstream_request.insert_header("Host", "ipinfo.io") {
-			Ok(()) => {},
-			Err(e) => { 
-				eprintln!("{}", e);
-				process::exit(1);
-			}
-		};
 		Ok(())
 	}
 	
@@ -245,30 +300,31 @@ impl ProxyHttp for Proxy {
 
 impl Bridge {
 	pub fn new(
-		tor: TorClient<PreferredRuntime>,
-		token_store: MemoryCache<String, IsolationToken>
+		tor: Arc<TorClient<PreferredRuntime>>,
+		token_store: Arc<MemoryCache<String, IsolationToken>>
 	) -> Self {
 		Self {
-			tor: Arc::new(tor),
-			token_store: Arc::new(token_store)
+			tor,
+			token_store
 		}
 	}
 	
-	pub async fn run_bridge(
-		tor: Arc<TorClient<PreferredRuntime>>,
-		token_store: Arc<MemoryCache<String, IsolationToken>>
-	) {
-		let addr = "127.0.0.1:19050";
-		let listener = TcpListener::bind(&addr).await.unwrap();
+	pub async fn run_bridge(self) -> anyhow::Result<()> {
+		match std::fs::remove_file(BRIDGE_SOCKET) {
+			Ok(()) => {}
+			Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => return Err(error.into()),
+		}
+		let listener = UnixListener::bind(BRIDGE_SOCKET)?;
 		
 		loop {
 			match listener.accept().await {
-				Ok((stream, peer)) => {
-					let tor = tor.clone();
-					let ts = token_store.clone();
+				Ok((stream, _)) => {
+					let tor = self.tor.clone();
+					let ts = self.token_store.clone();
 					tokio::spawn(async move {
 						if let Err(e) = Self::handle_connect(stream, tor, ts).await {
-							eprintln!("[bridge] {peer}: {e}");
+							eprintln!("[bridge] {e}");
 						}
 					});
 				}
@@ -278,29 +334,23 @@ impl Bridge {
 	}
 	
 	async fn handle_connect(
-		mut stream: TcpStream,
+		mut stream: UnixStream,
 		tor: Arc<TorClient<PreferredRuntime>>,
 		token_store: Arc<MemoryCache<String, IsolationToken>>
 	) -> anyhow::Result<()> {
-		//let (reader, mut writer) = io::split(stream);
-		//let mut reader = BufReader::new(reader);
-		
-		let dest = {
-			let mut reader = BufReader::new(&mut stream);
-			let mut line   = String::new();
-			reader.read_line(&mut line).await?;
-
-			let mut header = String::new();
-			loop {
-				reader.read_line(&mut header).await?;
-				if header.trim().is_empty() { break; }
-				header.clear();
+		let (dest, buffered_tunnel_data) = match read_connect_request(&mut stream).await {
+			Ok(request) => request,
+			Err(error) => {
+				let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+				return Err(error);
 			}
-
-			line.split_whitespace()
-				.nth(1)
-				.ok_or_else(|| anyhow::anyhow!("malformed CONNECT line"))?
-				.to_string()
+		};
+		let target = match parse_connect_destination(&dest) {
+			Ok(target) => target,
+			Err(error) => {
+				let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+				return Err(error);
+			}
 		};
 		
 		let token = match token_store.get(&dest) {
@@ -312,21 +362,22 @@ impl Bridge {
 			}
 		};
 		
-		let temp_dest = "ipinfo.io:80";
-		
 		let mut prefs = StreamPrefs::new();
 		prefs.set_isolation(token);
 		
-		let mut tor_stream = match tor.connect_with_prefs(&temp_dest, &prefs).await {
+		let mut tor_stream = match tor.connect_with_prefs(target, &prefs).await {
 			Ok(s)  => {
 				stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
 				s
 			}
 			Err(e) => {
-				stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+				stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
 				anyhow::bail!("tor→{dest}: {e}");
 			}
 		};
+		if !buffered_tunnel_data.is_empty() {
+			tor_stream.write_all(&buffered_tunnel_data).await?;
+		}
 		
 		tokio::io::copy_bidirectional(&mut stream, &mut tor_stream).await?;
 		Ok(()) //for now
@@ -384,7 +435,9 @@ fn main() -> Result<()> {
         let store = token_store.clone();
         std::thread::spawn(move || {
             let rt = Runtime::new().unwrap();
-            rt.block_on(Bridge::run_bridge(tor, store));
+			if let Err(error) = rt.block_on(Bridge::new(tor, store).run_bridge()) {
+				eprintln!("[bridge] failed to run: {error}");
+			}
         });
     }
 	
@@ -399,14 +452,53 @@ fn main() -> Result<()> {
 	};
 	server.bootstrap();
 	
-	let mut service = http_proxy_service(&server.configuration, Proxy { 
+	let mut http_options = HttpServerOptions::default();
+	http_options.allow_connect_method_proxying = true;
+
+	let mut service = ProxyServiceBuilder::new(&server.configuration, Proxy {
 		request_counter: 0.into(), 
 		cache: token_store.clone(),
 		//isolation_manager: IsolationHelper::new() ### Error, no constructors for traits
 		tor_client: tor_client.clone()
-	});
+	})
+	.server_options(http_options)
+	.build();
 	
 	service.add_tcp("127.0.0.1:8080");
 	server.add_service(service);
 	server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{parse_connect_destination, parse_connect_request};
+
+	#[test]
+	fn parses_connect_request_and_reports_header_length() {
+		let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\nclient-hello";
+
+		let parsed = parse_connect_request(request).unwrap();
+
+		assert_eq!(parsed, Some(("example.com:443".to_owned(), 59)));
+	}
+
+	#[test]
+	fn leaves_incomplete_requests_unparsed() {
+		let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n";
+
+		assert_eq!(parse_connect_request(request).unwrap(), None);
+	}
+
+	#[test]
+	fn rejects_non_connect_requests() {
+		let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+		assert!(parse_connect_request(request).is_err());
+	}
+
+	#[test]
+	fn rejects_connect_destinations_without_a_valid_port() {
+		assert!(parse_connect_destination("example.com:0").is_err());
+		assert!(parse_connect_destination("example.com").is_err());
+	}
 }
