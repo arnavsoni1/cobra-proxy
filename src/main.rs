@@ -82,6 +82,10 @@ impl Proxy {
     }
 }
 
+//trait TorStack {
+//	
+//}
+
 trait BridgeSession {
 	fn finish(
 		&self,
