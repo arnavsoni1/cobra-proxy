@@ -134,6 +134,42 @@ pub struct Bridge{
 	//port: u16
 }
 
+pub struct TorCircuit {
+	runtime: Runtime,
+	client: Arc<TorClient<PreferredRuntime>>,
+}
+
+impl TorCircuit {
+	pub fn bootstrap(config: TorClientConfig) -> anyhow::Result<Self> {
+		let runtime = Runtime::new()
+			.map_err(|error| anyhow::anyhow!("failed to create Tor runtime: {error}"))?;
+		let client = runtime
+			.block_on(TorClient::create_bootstrapped(config))
+			.map_err(|error| anyhow::anyhow!("failed to bootstrap Tor client: {error}"))?;
+
+		Ok(Self {
+			runtime,
+			client: Arc::new(client),
+		})
+	}
+
+	pub fn client(&self) -> Arc<TorClient<PreferredRuntime>> {
+		self.client.clone()
+	}
+
+	pub fn start_bridge(
+		&self,
+		token_store: Arc<MemoryCache<String, IsolationToken>>,
+	) {
+		let tor = self.client();
+		self.runtime.spawn(async move {
+			if let Err(error) = Bridge::new(tor, token_store).run_bridge().await {
+				eprintln!("[bridge] failed to run: {error}");
+			}
+		});
+	}
+}
+
 impl Proxy {
 	fn extract_id(id_option: Option<i64>) -> Result<String, String> {
         id_option
@@ -414,32 +450,17 @@ fn main() -> Result<()> {
 	//		process::exit(1);
 	//	}
 	//};
-	let tor_client: Arc<TorClient<PreferredRuntime>> = {
-		let rt = Runtime::new().unwrap();
-		let client = rt.block_on(async {
-			match TorClient::create_bootstrapped(config).await {
-				Ok(client) => client,
-				Err(e) => {
-					eprintln!("{}", e);
-					process::exit(1);
-				}
-			}
-		});
-		Arc::new(client)
+	let tor_circuit = match TorCircuit::bootstrap(config) {
+		Ok(circuit) => circuit,
+		Err(error) => {
+			eprintln!("{error}");
+			process::exit(1);
+		}
 	};
+	let tor_client = tor_circuit.client();
 	
 	let token_store: Arc<MemoryCache<String, IsolationToken>> = Arc::new(MemoryCache::new(10_000));
-	
-	{
-        let tor   = tor_client.clone();
-        let store = token_store.clone();
-        std::thread::spawn(move || {
-            let rt = Runtime::new().unwrap();
-			if let Err(error) = rt.block_on(Bridge::new(tor, store).run_bridge()) {
-				eprintln!("[bridge] failed to run: {error}");
-			}
-        });
-    }
+	tor_circuit.start_bridge(token_store.clone());
 	
 	let mut server =  match Server::new(None) {
 		Ok(s) => {
