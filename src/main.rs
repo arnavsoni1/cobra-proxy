@@ -2,6 +2,8 @@ use pingora::{
 	prelude::*, 
 	cache::{
 		MemCache, HttpCache, CacheMeta, Storage, 
+		eviction::{EvictionManager, lru::Manager as LruEvictionManager},
+		lock::CacheLock,
 		trace::SpanHandle,
 		CacheKey
 	},
@@ -40,12 +42,28 @@ use tokio::{
 //use anyhow::*;
 
 static CACHE: OnceLock<MemCache> = OnceLock::new();
+static CACHE_LOCK: OnceLock<CacheLock> = OnceLock::new();
+static CACHE_EVICTION: OnceLock<LruEvictionManager<CACHE_LRU_SHARDS>> = OnceLock::new();
+const CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+const CACHE_LRU_SHARDS: usize = 16;
+const CACHE_ITEMS_PER_SHARD: usize = 1_024;
+const CACHE_LOCK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONNECT_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONNECT_HEADERS: usize = 64;
 const BRIDGE_SOCKET: &str = "/tmp/proxy-bridge.sock";
 
 fn cache() -> &'static MemCache {
 	CACHE.get_or_init(MemCache::new)
+}
+
+fn cache_lock() -> &'static CacheLock {
+	CACHE_LOCK.get_or_init(|| CacheLock::new(CACHE_LOCK_MAX_AGE))
+}
+
+fn cache_eviction() -> &'static (dyn EvictionManager + Sync) {
+	CACHE_EVICTION.get_or_init(|| {
+		LruEvictionManager::with_capacity(CACHE_MAX_BYTES, CACHE_ITEMS_PER_SHARD)
+	})
 }
 
 fn parse_connect_request(buffer: &[u8]) -> anyhow::Result<Option<(String, usize)>> {
@@ -277,9 +295,9 @@ impl ProxyHttp for Proxy {
 		if session.req_header().method == http::Method::GET {
             session.cache.enable(
                 cache(),
-                None, // eviction policy  
+				Some(cache_eviction()), // eviction policy
                 None, // cache predictor 
-                None, // distributed lock 
+				Some(cache_lock()), // process-local cache lock
 				None  // cache option override
             );
         }
