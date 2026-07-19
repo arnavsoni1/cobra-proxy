@@ -36,6 +36,7 @@ use tokio::{
 	io::{self, AsyncReadExt, AsyncWriteExt},
 	runtime::Runtime, 
 	net::{TcpListener, TcpStream, UnixListener, UnixStream},
+	sync::{OwnedSemaphorePermit, Semaphore},
 	time::Duration
 	//sync::{Semaphore, SemaphorePermit}
 };
@@ -51,6 +52,11 @@ const CACHE_LOCK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONNECT_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONNECT_HEADERS: usize = 64;
 const BRIDGE_SOCKET: &str = "/tmp/proxy-bridge.sock";
+// Tune based on VPS bandwidth and observed circuit build latency.
+const MAX_CONCURRENT_CIRCUIT_BUILDS: usize = 32;
+const CIRCUIT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10); // tune later
+const CIRCUIT_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const CIRCUIT_CAPACITY_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 fn cache() -> &'static MemCache {
 	CACHE.get_or_init(MemCache::new)
@@ -145,10 +151,64 @@ pub struct CircuitHandle<'session, Phase> {
 	// guard: RateLimitGuard
 }
 
+#[derive(Default)]
+struct CircuitMetrics {
+	acquire_timeouts: AtomicUsize,
+	circuit_build_count: AtomicUsize,
+	circuit_build_latency_micros: AtomicUsize,
+}
+
+impl CircuitMetrics {
+	fn record_build_latency(&self, latency: Duration) {
+		let latency_micros = latency.as_micros().min(usize::MAX as u128) as usize;
+		self.circuit_build_latency_micros.fetch_add(latency_micros, Ordering::Relaxed);
+		self.circuit_build_count.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn log(&self, circuit_semaphore: &Semaphore) {
+		let permits_in_use = MAX_CONCURRENT_CIRCUIT_BUILDS
+			.saturating_sub(circuit_semaphore.available_permits());
+		let acquire_timeouts = self.acquire_timeouts.load(Ordering::Relaxed);
+		let circuit_build_count = self.circuit_build_count.load(Ordering::Relaxed);
+		let total_latency_micros = self.circuit_build_latency_micros.load(Ordering::Relaxed);
+		let average_latency_ms = if circuit_build_count == 0 {
+			0.0
+		} else {
+			total_latency_micros as f64 / circuit_build_count as f64 / 1_000.0
+		};
+
+		eprintln!(
+			"[bridge] circuit metrics: permits_in_use={permits_in_use} acquire_timeouts={acquire_timeouts} circuit_build_count={circuit_build_count} average_build_latency_ms={average_latency_ms:.2}"
+		);
+	}
+}
+
+async fn acquire_circuit_permit<S>(
+	stream: &mut S,
+	circuit_semaphore: Arc<Semaphore>,
+	circuit_metrics: &CircuitMetrics,
+	acquire_timeout: Duration,
+) -> anyhow::Result<OwnedSemaphorePermit>
+where
+	S: tokio::io::AsyncWrite + Unpin,
+{
+	match tokio::time::timeout(acquire_timeout, circuit_semaphore.acquire_owned()).await {
+		Ok(Ok(permit)) => Ok(permit),
+		Ok(Err(error)) => anyhow::bail!("circuit admission semaphore closed: {error}"),
+		Err(_) => {
+			circuit_metrics.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+			let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
+			anyhow::bail!("circuit capacity exceeded, request timed out waiting for a slot");
+		}
+	}
+}
+
 #[derive(Clone)]
 pub struct Bridge{
 	tor: Arc<TorClient<PreferredRuntime>>,
 	token_store: Arc<MemoryCache<String, IsolationToken>>,
+	circuit_semaphore: Arc<Semaphore>,
+	circuit_metrics: Arc<CircuitMetrics>,
 	//port: u16
 }
 
@@ -359,7 +419,9 @@ impl Bridge {
 	) -> Self {
 		Self {
 			tor,
-			token_store
+			token_store,
+			circuit_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CIRCUIT_BUILDS)),
+			circuit_metrics: Arc::new(CircuitMetrics::default()),
 		}
 	}
 	
@@ -370,14 +432,34 @@ impl Bridge {
 			Err(error) => return Err(error.into()),
 		}
 		let listener = UnixListener::bind(BRIDGE_SOCKET)?;
+		let circuit_semaphore = self.circuit_semaphore.clone();
+		let circuit_metrics = self.circuit_metrics.clone();
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(CIRCUIT_METRICS_LOG_INTERVAL);
+			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+			// Tokio intervals tick immediately once; consume that tick so metrics are periodic.
+			interval.tick().await;
+			loop {
+				interval.tick().await;
+				circuit_metrics.log(&circuit_semaphore);
+			}
+		});
 		
 		loop {
 			match listener.accept().await {
 				Ok((stream, _)) => {
 					let tor = self.tor.clone();
 					let ts = self.token_store.clone();
+					let circuit_semaphore = self.circuit_semaphore.clone();
+					let circuit_metrics = self.circuit_metrics.clone();
 					tokio::spawn(async move {
-						if let Err(e) = Self::handle_connect(stream, tor, ts).await {
+						if let Err(e) = Self::handle_connect(
+							stream,
+							tor,
+							ts,
+							circuit_semaphore,
+							circuit_metrics,
+						).await {
 							eprintln!("[bridge] {e}");
 						}
 					});
@@ -390,7 +472,9 @@ impl Bridge {
 	async fn handle_connect(
 		mut stream: UnixStream,
 		tor: Arc<TorClient<PreferredRuntime>>,
-		token_store: Arc<MemoryCache<String, IsolationToken>>
+		token_store: Arc<MemoryCache<String, IsolationToken>>,
+		circuit_semaphore: Arc<Semaphore>,
+		circuit_metrics: Arc<CircuitMetrics>,
 	) -> anyhow::Result<()> {
 		let (dest, buffered_tunnel_data) = match read_connect_request(&mut stream).await {
 			Ok(request) => request,
@@ -419,7 +503,20 @@ impl Bridge {
 		let mut prefs = StreamPrefs::new();
 		prefs.set_isolation(token);
 		
-		let mut tor_stream = match tor.connect_with_prefs(target, &prefs).await {
+		let circuit_permit = acquire_circuit_permit(
+			&mut stream,
+			circuit_semaphore,
+			&circuit_metrics,
+			CIRCUIT_ACQUIRE_TIMEOUT,
+		).await?;
+		let circuit_build_started = tokio::time::Instant::now();
+		let connect_result = tor.connect_with_prefs(target, &prefs).await;
+		circuit_metrics.record_build_latency(circuit_build_started.elapsed());
+		// Option A: this permit guards only circuit build/connect work. Holding it for
+		// copy_bidirectional would cap long-lived tunnels instead of the costly setup step.
+		drop(circuit_permit);
+
+		let mut tor_stream = match connect_result {
 			Ok(s)  => {
 				stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
 				s
@@ -552,7 +649,20 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-	use super::{parse_connect_destination, parse_connect_request};
+	use super::{
+		acquire_circuit_permit, parse_connect_destination, parse_connect_request,
+		CircuitMetrics,
+	};
+	use std::sync::{
+		atomic::Ordering,
+		Arc,
+	};
+	use tokio::{
+		io::AsyncReadExt,
+		runtime::Runtime,
+		sync::Semaphore,
+		time::{timeout, Duration, Instant},
+	};
 
 	#[test]
 	fn parses_connect_request_and_reports_header_length() {
@@ -581,5 +691,86 @@ mod tests {
 	fn rejects_connect_destinations_without_a_valid_port() {
 		assert!(parse_connect_destination("example.com:0").is_err());
 		assert!(parse_connect_destination("example.com").is_err());
+	}
+
+	#[test]
+	fn circuit_semaphore_limits_concurrent_builds() {
+		Runtime::new().unwrap().block_on(async {
+			const CAPACITY: usize = 2;
+			let semaphore = Arc::new(Semaphore::new(CAPACITY));
+			let first_permit = semaphore.clone().acquire_owned().await.unwrap();
+			let second_permit = semaphore.clone().acquire_owned().await.unwrap();
+
+			let waiting_semaphore = semaphore.clone();
+			let waiting_attempt = tokio::spawn(async move {
+				waiting_semaphore.acquire_owned().await.unwrap()
+			});
+			tokio::task::yield_now().await;
+			assert!(!waiting_attempt.is_finished());
+			assert_eq!(semaphore.available_permits(), 0);
+
+			drop(first_permit);
+			let third_permit = timeout(Duration::from_millis(250), waiting_attempt)
+				.await
+				.expect("waiting acquire should complete after a permit is released")
+				.unwrap();
+			assert_eq!(semaphore.available_permits(), 0);
+
+			drop(second_permit);
+			drop(third_permit);
+			assert_eq!(semaphore.available_permits(), CAPACITY);
+		});
+	}
+
+	#[test]
+	fn circuit_acquire_times_out_when_capacity_stays_saturated() {
+		Runtime::new().unwrap().block_on(async {
+			let semaphore = Arc::new(Semaphore::new(1));
+			let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
+			let metrics = CircuitMetrics::default();
+			let mut sink = tokio::io::sink();
+			let short_timeout = Duration::from_millis(25);
+			let started = Instant::now();
+
+			let result = acquire_circuit_permit(
+				&mut sink,
+				semaphore,
+				&metrics,
+				short_timeout,
+			).await;
+			let elapsed = started.elapsed();
+
+			assert!(result.is_err());
+			assert!(result.unwrap_err().to_string().contains("circuit capacity exceeded"));
+			assert!(elapsed >= short_timeout);
+			assert!(elapsed < Duration::from_millis(500));
+			assert_eq!(metrics.acquire_timeouts.load(Ordering::Relaxed), 1);
+		});
+	}
+
+	#[test]
+	fn circuit_acquire_timeout_writes_service_unavailable_response() {
+		Runtime::new().unwrap().block_on(async {
+			let semaphore = Arc::new(Semaphore::new(1));
+			let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
+			let metrics = CircuitMetrics::default();
+			let (mut client, mut server) = tokio::io::duplex(256);
+
+			let result = acquire_circuit_permit(
+				&mut server,
+				semaphore,
+				&metrics,
+				Duration::from_millis(10),
+			).await;
+			assert!(result.is_err());
+			drop(server);
+
+			let mut response = Vec::new();
+			client.read_to_end(&mut response).await.unwrap();
+			assert_eq!(
+				response,
+				b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+			);
+		});
 	}
 }
