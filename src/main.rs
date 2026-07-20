@@ -1161,6 +1161,9 @@ where
 			return Ok(bytes_copied);
 		}
 		writer.write_all(&buffer[..read]).await?;
+		// Arti's DataStream buffers partial relay cells. write_all() only queues
+		// those bytes, so flush before waiting for traffic in the other direction.
+		writer.flush().await?;
 		bytes_copied = bytes_copied.saturating_add(read as u64);
 		if let Some(byte_counter) = byte_counter {
 			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
@@ -1924,6 +1927,9 @@ impl Bridge {
 		};
 		if !buffered_tunnel_data.is_empty() {
 			tor_stream.write_all(&buffered_tunnel_data).await?;
+			// These bytes were read alongside the CONNECT header and bypass the
+			// regular copy loop, so they need their own explicit Arti flush.
+			tor_stream.flush().await?;
 			self.circuit_metrics
 				.bytes_to_tor
 				.fetch_add(buffered_tunnel_data.len() as u64, Ordering::Relaxed);
@@ -2077,16 +2083,63 @@ mod tests {
 	};
 	use pingora::prelude::{RequestHeader, ResponseHeader};
 	use std::sync::{
-		atomic::Ordering,
-		Arc,
+		atomic::{AtomicUsize, Ordering},
+		Arc, Mutex,
+	};
+	use std::{
+		pin::Pin,
+		task::{Context, Poll},
 	};
 	use std::time::Instant as StdInstant;
 	use tokio::{
-		io::{AsyncReadExt, AsyncWriteExt},
+		io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
 		runtime::Runtime,
 		sync::Semaphore,
 		time::{timeout, Duration, Instant},
 	};
+
+	struct FlushGatedWriter {
+		pending: Vec<u8>,
+		flushed: Arc<Mutex<Vec<u8>>>,
+		flush_count: Arc<AtomicUsize>,
+	}
+
+	impl FlushGatedWriter {
+		fn new() -> (Self, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+			let flushed = Arc::new(Mutex::new(Vec::new()));
+			let flush_count = Arc::new(AtomicUsize::new(0));
+			(Self {
+				pending: Vec::new(),
+				flushed: flushed.clone(),
+				flush_count: flush_count.clone(),
+			}, flushed, flush_count)
+		}
+	}
+
+	impl AsyncWrite for FlushGatedWriter {
+		fn poll_write(
+			mut self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buffer: &[u8],
+		) -> Poll<std::io::Result<usize>> {
+			self.pending.extend_from_slice(buffer);
+			Poll::Ready(Ok(buffer.len()))
+		}
+
+		fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			let pending = std::mem::take(&mut self.pending);
+			self.flushed
+				.lock()
+				.unwrap_or_else(|poisoned| poisoned.into_inner())
+				.extend_from_slice(&pending);
+			self.flush_count.fetch_add(1, Ordering::Relaxed);
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			self.poll_flush(cx)
+		}
+	}
 
 	fn cache_request(method: &str, uri: &str, host: &str) -> RequestHeader {
 		let mut request = RequestHeader::build(method, b"/", None).unwrap();
@@ -2286,6 +2339,36 @@ mod tests {
 			assert_eq!(response, super::CIRCUIT_CAPACITY_RESPONSE);
 			assert_eq!(metrics.queued_tunnels.load(Ordering::Relaxed), 0);
 			assert_eq!(metrics.rejected_tunnels.load(Ordering::Relaxed), 1);
+		});
+	}
+
+	#[test]
+	fn tunnel_copy_flushes_data_before_waiting_for_eof() {
+		Runtime::new().unwrap().block_on(async {
+			let (mut client, bridge_reader) = tokio::io::duplex(64);
+			let (writer, flushed, flush_count) = FlushGatedWriter::new();
+			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
+			let copying = tokio::spawn(async move {
+				copy_one_direction(bridge_reader, writer, activity, None).await
+			});
+
+			client.write_all(b"request").await.unwrap();
+			timeout(Duration::from_millis(250), async {
+				loop {
+					let observed = flushed
+						.lock()
+						.unwrap_or_else(|poisoned| poisoned.into_inner())
+						.clone();
+					if observed == b"request" {
+						break;
+					}
+					tokio::task::yield_now().await;
+				}
+			}).await.expect("copy must flush without waiting for the reader to close");
+			assert_eq!(flush_count.load(Ordering::Relaxed), 1);
+
+			client.shutdown().await.unwrap();
+			assert_eq!(copying.await.unwrap().unwrap(), 7);
 		});
 	}
 
