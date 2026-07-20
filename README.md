@@ -198,6 +198,33 @@ The required local verification order is:
 
 At the time this document was written, the compiler check passed and 30 automated tests passed. Two tests remain intentionally ignored because they require a running proxy and controlled external test origins. Published reliability or performance claims must come from those controlled tests, not from public websites or a local in-memory transport benchmark.
 
+### End-to-end deployment test
+
+On Linux, the complete self-check is:
+
+```bash
+./test-deployment.sh
+```
+
+The runner checks the locked build, automated tests, release build, process startup, Prometheus contract, metrics path scope, destination blocking, isolation-header validation, session and strict HTTPS forwarding, ordinary HTTP forwarding, Tor egress, runtime metrics activity, and process health. It stops the process it started and writes a timestamped evidence bundle to `artifacts/deployment-e2e/`, including per-check logs, proxy logs, metrics snapshots, response samples, and `summary.txt`.
+
+To check a service already deployed on a VPS, run the framework on that host so its loopback-only listeners remain private:
+
+```bash
+./test-deployment.sh --mode running \
+  --proxy-url http://127.0.0.1:8080 \
+  --metrics-url http://127.0.0.1:9090/metrics
+```
+
+Caching requires an origin you control because a reliable assertion needs a known `Cache-Control: public, max-age=...` response. Enable that additional check with:
+
+```bash
+./test-deployment.sh \
+  --cache-url http://your-authorized-test-origin.example/cacheable
+```
+
+Use `./test-deployment.sh --help` for endpoint, timeout, artifact-directory, build-reuse, and keep-running options. The default external matrix sends only three functional requests: one Tor Check request plus one HTTPS and one plain-HTTP request to Example Domain. It is a functional verification, not a load test.
+
 ## Ownership, licensing, and commercial terms
 
 ### Recommended structure

@@ -721,6 +721,23 @@ pub struct RequestCtx{
 //	permit: SemaphorePermit<'static>
 //}
 
+/// Owns one global circuit-build admission slot.
+///
+/// This is deliberately not a per-account request-rate limiter. The owned
+/// permit makes release cancellation-safe: every return path, panic unwind,
+/// or aborted connection task releases the slot when this guard is dropped.
+#[must_use = "dropping the rate-limit guard immediately releases its circuit-build slot"]
+#[derive(Debug)]
+pub struct RateLimitGuard {
+	_permit: OwnedSemaphorePermit,
+}
+
+impl From<OwnedSemaphorePermit> for RateLimitGuard {
+	fn from(permit: OwnedSemaphorePermit) -> Self {
+		Self { _permit: permit }
+	}
+}
+
 pub struct CircuitHandle<'session, Phase> {
 	token: IsolationToken,
 	phase: PhantomData<Phase>,
@@ -765,8 +782,9 @@ impl LatencyHistogram {
 #[derive(Default)]
 struct CircuitMetrics {
 	acquire_timeouts: AtomicUsize,
-	circuit_build_count: AtomicUsize,
-	circuit_build_latency_micros: AtomicUsize,
+	circuit_build_count: AtomicU64,
+	circuit_build_latency_micros: AtomicU64,
+	queued_circuit_builds: AtomicUsize,
 	active_tunnels: AtomicUsize,
 	queued_tunnels: AtomicUsize,
 	rejected_tunnels: AtomicUsize,
@@ -795,7 +813,7 @@ struct CircuitMetrics {
 
 impl CircuitMetrics {
 	fn record_build_latency(&self, latency: Duration) {
-		let latency_micros = latency.as_micros().min(usize::MAX as u128) as usize;
+		let latency_micros = latency.as_micros().min(u64::MAX as u128) as u64;
 		self.circuit_build_latency_micros.fetch_add(latency_micros, Ordering::Relaxed);
 		self.circuit_build_count.fetch_add(1, Ordering::Relaxed);
 		self.tor_connect_latency.observe(latency);
@@ -830,12 +848,30 @@ impl CircuitMetrics {
 		};
 		let active_tunnels = self.active_tunnels.load(Ordering::Relaxed);
 		let queued_tunnels = self.queued_tunnels.load(Ordering::Relaxed);
+		let queued_circuit_builds = self.queued_circuit_builds.load(Ordering::Relaxed);
 		let rejected_tunnels = self.rejected_tunnels.load(Ordering::Relaxed);
 		let completed_tunnels = self.completed_tunnels.load(Ordering::Relaxed);
 
 		eprintln!(
-			"[bridge] circuit metrics: permits_in_use={permits_in_use} active_tunnels={active_tunnels} queued_tunnels={queued_tunnels} rejected_tunnels={rejected_tunnels} completed_tunnels={completed_tunnels} acquire_timeouts={acquire_timeouts} circuit_build_count={circuit_build_count} average_build_latency_ms={average_latency_ms:.2}"
+			"[bridge] circuit metrics: permits_in_use={permits_in_use} queued_circuit_builds={queued_circuit_builds} active_tunnels={active_tunnels} queued_tunnels={queued_tunnels} rejected_tunnels={rejected_tunnels} completed_tunnels={completed_tunnels} acquire_timeouts={acquire_timeouts} circuit_build_count={circuit_build_count} average_build_latency_ms={average_latency_ms:.2}"
 		);
+	}
+}
+
+struct AtomicGaugeGuard<'a> {
+	counter: &'a AtomicUsize,
+}
+
+impl<'a> AtomicGaugeGuard<'a> {
+	fn increment(counter: &'a AtomicUsize) -> Self {
+		counter.fetch_add(1, Ordering::Relaxed);
+		Self { counter }
+	}
+}
+
+impl Drop for AtomicGaugeGuard<'_> {
+	fn drop(&mut self) {
+		self.counter.fetch_sub(1, Ordering::Relaxed);
 	}
 }
 
@@ -929,6 +965,10 @@ fn render_prometheus_metrics(
 	}
 	metric!("proxy_active_tunnels", "Currently active Tor tunnels.", "gauge", metrics.active_tunnels.load(Ordering::Relaxed));
 	metric!("proxy_queued_tunnels", "Requests waiting for tunnel capacity.", "gauge", metrics.queued_tunnels.load(Ordering::Relaxed));
+	metric!("proxy_queued_circuit_builds", "Requests waiting for circuit-build capacity.", "gauge", metrics.queued_circuit_builds.load(Ordering::Relaxed));
+	metric!("proxy_circuit_acquire_timeouts_total", "Requests that timed out waiting for circuit-build capacity.", "counter", metrics.acquire_timeouts.load(Ordering::Relaxed));
+	metric!("proxy_circuit_build_attempts_total", "Completed Tor circuit or stream establishment attempts.", "counter", metrics.circuit_build_count.load(Ordering::Relaxed));
+	metric!("proxy_circuit_build_latency_microseconds_total", "Cumulative Tor circuit or stream establishment latency in microseconds.", "counter", metrics.circuit_build_latency_micros.load(Ordering::Relaxed));
 	metric!("proxy_rejected_tunnels_total", "Tunnel and connection capacity rejections.", "counter", metrics.rejected_tunnels.load(Ordering::Relaxed));
 	metric!("proxy_completed_tunnels_total", "Tunnel attempts that acquired active capacity.", "counter", metrics.completed_tunnels.load(Ordering::Relaxed));
 	metric!("proxy_connect_timeouts_total", "Tor establishment timeouts.", "counter", metrics.connect_timeouts.load(Ordering::Relaxed));
@@ -1084,9 +1124,10 @@ async fn acquire_active_tunnel_permit<S>(
 where
 	S: tokio::io::AsyncWrite + Unpin,
 {
-	metrics.queued_tunnels.fetch_add(1, Ordering::Relaxed);
-	let result = tokio::time::timeout(wait_timeout, tunnel_semaphore.acquire_owned()).await;
-	metrics.queued_tunnels.fetch_sub(1, Ordering::Relaxed);
+	let result = {
+		let _queued = AtomicGaugeGuard::increment(&metrics.queued_tunnels);
+		tokio::time::timeout(wait_timeout, tunnel_semaphore.acquire_owned()).await
+	};
 	match result {
 		Ok(Ok(permit)) => {
 			metrics.active_tunnels.fetch_add(1, Ordering::Relaxed);
@@ -1186,13 +1227,20 @@ async fn acquire_circuit_permit<S>(
 	circuit_semaphore: Arc<Semaphore>,
 	circuit_metrics: &CircuitMetrics,
 	acquire_timeout: Duration,
-) -> anyhow::Result<OwnedSemaphorePermit>
+) -> anyhow::Result<RateLimitGuard>
 where
 	S: tokio::io::AsyncWrite + Unpin,
 {
-	match tokio::time::timeout(acquire_timeout, circuit_semaphore.acquire_owned()).await {
-		Ok(Ok(permit)) => Ok(permit),
-		Ok(Err(error)) => anyhow::bail!("circuit admission semaphore closed: {error}"),
+	let result = {
+		let _queued = AtomicGaugeGuard::increment(&circuit_metrics.queued_circuit_builds);
+		tokio::time::timeout(acquire_timeout, circuit_semaphore.acquire_owned()).await
+	};
+	match result {
+		Ok(Ok(permit)) => Ok(permit.into()),
+		Ok(Err(error)) => {
+			let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
+			anyhow::bail!("circuit admission semaphore closed: {error}");
+		}
 		Err(_) => {
 			circuit_metrics.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
 			let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
@@ -1640,8 +1688,8 @@ impl Bridge {
 						let bridge = internal_bridge.clone();
 						tokio::spawn(async move {
 							let _connection_permit = connection_permit;
-							if bridge.handle_internal_connect(stream).await.is_err() {
-								eprintln!("{{\"event\":\"bridge_connection_error\"}}");
+							if let Err(error) = bridge.handle_internal_connect(stream).await {
+								eprintln!("[bridge] internal connection error: {error:#}");
 							}
 						});
 					}
@@ -1664,8 +1712,8 @@ impl Bridge {
 					let bridge = self.clone();
 					tokio::spawn(async move {
 						let _connection_permit = connection_permit;
-						if bridge.handle_public_connection(stream).await.is_err() {
-							eprintln!("{{\"event\":\"ingress_connection_error\"}}");
+						if let Err(error) = bridge.handle_public_connection(stream).await {
+							eprintln!("[bridge] ingress connection error: {error:#}");
 						}
 					});
 				}
@@ -2593,6 +2641,56 @@ mod tests {
 	}
 
 	#[test]
+	fn rate_limit_guard_releases_its_owned_permit() {
+		Runtime::new().unwrap().block_on(async {
+			let semaphore = Arc::new(Semaphore::new(1));
+			let metrics = CircuitMetrics::default();
+			let mut sink = tokio::io::sink();
+
+			let guard = acquire_circuit_permit(
+				&mut sink,
+				semaphore.clone(),
+				&metrics,
+				Duration::from_millis(25),
+			).await.unwrap();
+			assert_eq!(semaphore.available_permits(), 0);
+			assert_eq!(metrics.queued_circuit_builds.load(Ordering::Relaxed), 0);
+
+			drop(guard);
+			assert_eq!(semaphore.available_permits(), 1);
+		});
+	}
+
+	#[test]
+	fn cancelled_circuit_wait_cleans_up_its_queue_metric() {
+		Runtime::new().unwrap().block_on(async {
+			let semaphore = Arc::new(Semaphore::new(1));
+			let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
+			let metrics = Arc::new(CircuitMetrics::default());
+			let task_metrics = metrics.clone();
+			let waiting = tokio::spawn(async move {
+				let mut sink = tokio::io::sink();
+				acquire_circuit_permit(
+					&mut sink,
+					semaphore,
+					&task_metrics,
+					Duration::from_secs(30),
+				).await
+			});
+
+			timeout(Duration::from_millis(250), async {
+				while metrics.queued_circuit_builds.load(Ordering::Relaxed) != 1 {
+					tokio::task::yield_now().await;
+				}
+			}).await.expect("circuit acquire should enter the wait queue");
+
+			waiting.abort();
+			let _ = waiting.await;
+			assert_eq!(metrics.queued_circuit_builds.load(Ordering::Relaxed), 0);
+		});
+	}
+
+	#[test]
 	fn circuit_acquire_times_out_when_capacity_stays_saturated() {
 		Runtime::new().unwrap().block_on(async {
 			let semaphore = Arc::new(Semaphore::new(1));
@@ -2615,6 +2713,7 @@ mod tests {
 			assert!(elapsed >= short_timeout);
 			assert!(elapsed < Duration::from_millis(500));
 			assert_eq!(metrics.acquire_timeouts.load(Ordering::Relaxed), 1);
+			assert_eq!(metrics.queued_circuit_builds.load(Ordering::Relaxed), 0);
 		});
 	}
 
@@ -2641,6 +2740,32 @@ mod tests {
 				response,
 				b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 			);
+			assert_eq!(metrics.queued_circuit_builds.load(Ordering::Relaxed), 0);
+		});
+	}
+
+	#[test]
+	fn closed_circuit_admission_returns_service_unavailable() {
+		Runtime::new().unwrap().block_on(async {
+			let semaphore = Arc::new(Semaphore::new(1));
+			semaphore.close();
+			let metrics = CircuitMetrics::default();
+			let (mut client, mut server) = tokio::io::duplex(256);
+
+			let result = acquire_circuit_permit(
+				&mut server,
+				semaphore,
+				&metrics,
+				Duration::from_millis(25),
+			).await;
+			assert!(result.unwrap_err().to_string().contains("semaphore closed"));
+			drop(server);
+
+			let mut response = Vec::new();
+			client.read_to_end(&mut response).await.unwrap();
+			assert_eq!(response, super::CIRCUIT_CAPACITY_RESPONSE);
+			assert_eq!(metrics.acquire_timeouts.load(Ordering::Relaxed), 0);
+			assert_eq!(metrics.queued_circuit_builds.load(Ordering::Relaxed), 0);
 		});
 	}
 }
