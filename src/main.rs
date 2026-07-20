@@ -1339,30 +1339,30 @@ impl Proxy {
 //	
 //}
 
-trait BridgeSession {
-	fn finish(
-		&self,
-		storage: &'static (dyn Storage + Sync),
-		trace: SpanHandle,
-		session: &mut Session,
-		token: IsolationToken
-	) -> Result<()>;
-	
-	fn persist_token(
-        &self,
-        storage: &'static (dyn Storage + Sync),
-        key: &str,
-        token: IsolationToken,
-        ttl: Option<Duration>,
-    ) -> Result<()>;
-	
-	fn rotate_token(
-        &self,
-        storage: &'static (dyn Storage + Sync),
-        key: &str,
-    ) -> Result<IsolationToken>;
-	
-}
+// trait BridgeSession {
+// 	fn finish(
+// 		&self,
+// 		storage: &'static (dyn Storage + Sync),
+// 		trace: SpanHandle,
+// 		session: &mut Session,
+// 		token: IsolationToken
+// 	) -> Result<()>;
+//
+// 	fn persist_token(
+//         &self,
+//         storage: &'static (dyn Storage + Sync),
+//         key: &str,
+//         token: IsolationToken,
+//         ttl: Option<Duration>,
+//     ) -> Result<()>;
+//
+// 	fn rotate_token(
+//         &self,
+//         storage: &'static (dyn Storage + Sync),
+//         key: &str,
+//     ) -> Result<IsolationToken>;
+//
+// }
 
 #[async_trait]
 impl ProxyHttp for Proxy {
@@ -1998,51 +1998,51 @@ impl Bridge {
 	}
 }
 
-impl BridgeSession for Bridge {
-	fn finish(
-		&self,
-		storage: &'static (dyn Storage + Sync),
-		_trace: SpanHandle,
-		session: &mut Session,
-		token: IsolationToken
-	) -> Result<()> {
-		let host = session
-			.req_header()
-			.headers
-			.get(http::header::HOST)
-			.and_then(|value| value.to_str().ok())
-			.ok_or_else(|| Error::new(InvalidHTTPHeader))?;
-		let authority = host
-			.parse::<http::uri::Authority>()
-			.map_err(|_| Error::new(InvalidHTTPHeader))?;
-		let key = format!(
-			"{}:{}",
-			authority.host(),
-			authority.port_u16().unwrap_or(80)
-		);
-
-		self.persist_token(storage, &key, token, None)
-	}
-
-	fn persist_token(
-		&self,
-		_storage: &'static (dyn Storage + Sync),
-		key: &str,
-		token: IsolationToken,
-		ttl: Option<Duration>,
-	) -> Result<()> {
-		self.token_store.put(key, token, ttl);
-		Ok(())
-	}
-
-	fn rotate_token(
-		&self,
-		_storage: &'static (dyn Storage + Sync),
-		key: &str,
-	) -> Result<IsolationToken> {
-		Ok(self.token_store.rotate(key).token)
-	}
-}
+// impl BridgeSession for Bridge {
+// 	fn finish(
+// 		&self,
+// 		storage: &'static (dyn Storage + Sync),
+// 		_trace: SpanHandle,
+// 		session: &mut Session,
+// 		token: IsolationToken
+// 	) -> Result<()> {
+// 		let host = session
+// 			.req_header()
+// 			.headers
+// 			.get(http::header::HOST)
+// 			.and_then(|value| value.to_str().ok())
+// 			.ok_or_else(|| Error::new(InvalidHTTPHeader))?;
+// 		let authority = host
+// 			.parse::<http::uri::Authority>()
+// 			.map_err(|_| Error::new(InvalidHTTPHeader))?;
+// 		let key = format!(
+// 			"{}:{}",
+// 			authority.host(),
+// 			authority.port_u16().unwrap_or(80)
+// 		);
+//
+// 		self.persist_token(storage, &key, token, None)
+// 	}
+//
+// 	fn persist_token(
+// 		&self,
+// 		_storage: &'static (dyn Storage + Sync),
+// 		key: &str,
+// 		token: IsolationToken,
+// 		ttl: Option<Duration>,
+// 	) -> Result<()> {
+// 		self.token_store.put(key, token, ttl);
+// 		Ok(())
+// 	}
+//
+// 	fn rotate_token(
+// 		&self,
+// 		_storage: &'static (dyn Storage + Sync),
+// 		key: &str,
+// 	) -> Result<IsolationToken> {
+// 		Ok(self.token_store.rotate(key).token)
+// 	}
+// }
 
 //#[tokio::main]
 fn main() -> Result<()> {
