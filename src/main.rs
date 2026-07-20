@@ -1155,9 +1155,18 @@ where
 	let mut bytes_copied = 0_u64;
 	let mut buffer = [0_u8; 16 * 1024];
 	loop {
-		let read = reader.read(&mut buffer).await?;
+		let read = match reader.read(&mut buffer).await {
+			Ok(read) => read,
+			// Arti can report a remotely closed DataStream as NotConnected rather
+			// than EOF. It is a completed tunnel teardown, not an ingress failure.
+			Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+				shutdown_copy_writer(&mut writer).await?;
+				return Ok(bytes_copied);
+			}
+			Err(error) => return Err(error),
+		};
 		if read == 0 {
-			writer.shutdown().await?;
+			shutdown_copy_writer(&mut writer).await?;
 			return Ok(bytes_copied);
 		}
 		writer.write_all(&buffer[..read]).await?;
@@ -1169,6 +1178,23 @@ where
 			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
 		}
 		activity.send_modify(|generation| *generation = generation.wrapping_add(1));
+	}
+}
+
+async fn shutdown_copy_writer<W>(writer: &mut W) -> io::Result<()>
+where
+	W: tokio::io::AsyncWrite + Unpin,
+{
+	match writer.shutdown().await {
+		Ok(()) => Ok(()),
+		// Arti maps an already-closed DataStream to NotConnected and an
+		// already-closed circuit to ConnectionReset. Both are clean only here,
+		// after the copy direction has reached its shutdown path.
+		Err(error) if matches!(
+			error.kind(),
+			io::ErrorKind::NotConnected | io::ErrorKind::ConnectionReset
+		) => Ok(()),
+		Err(error) => Err(error),
 	}
 }
 
@@ -2076,6 +2102,7 @@ mod tests {
 		acquire_active_tunnel_permit, acquire_circuit_permit, canonical_cache_key_parts,
 		canonical_connect_destination_key, conservative_response_cacheable, connect_destination_allowed,
 		copy_bidirectional_with_idle_timeout, copy_bidirectional_with_idle_timeout_and_counters,
+		copy_one_direction,
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
 		render_prometheus_metrics, request_cache_eligible, resolve_isolation,
 		serve_prometheus_connection, take_isolation_request, CircuitBreaker, CircuitMetrics,
@@ -2092,11 +2119,53 @@ mod tests {
 	};
 	use std::time::Instant as StdInstant;
 	use tokio::{
-		io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+		io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 		runtime::Runtime,
 		sync::Semaphore,
 		time::{timeout, Duration, Instant},
 	};
+
+	struct ReadError {
+		kind: std::io::ErrorKind,
+	}
+
+	impl AsyncRead for ReadError {
+		fn poll_read(
+			self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			_buf: &mut ReadBuf<'_>,
+		) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Err(std::io::Error::new(
+				self.kind,
+				"read error",
+			)))
+		}
+	}
+
+	struct ClosedStreamShutdownWriter {
+		kind: std::io::ErrorKind,
+	}
+
+	impl AsyncWrite for ClosedStreamShutdownWriter {
+		fn poll_write(
+			self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			buffer: &[u8],
+		) -> Poll<std::io::Result<usize>> {
+			Poll::Ready(Ok(buffer.len()))
+		}
+
+		fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Ok(()))
+		}
+
+		fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Err(std::io::Error::new(
+				self.kind,
+				"closed stream teardown",
+			)))
+		}
+	}
 
 	struct FlushGatedWriter {
 		pending: Vec<u8>,
@@ -2369,6 +2438,43 @@ mod tests {
 
 			client.shutdown().await.unwrap();
 			assert_eq!(copying.await.unwrap().unwrap(), 7);
+		});
+	}
+
+	#[test]
+	fn tunnel_copy_normalizes_only_closed_stream_teardown() {
+		Runtime::new().unwrap().block_on(async {
+			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
+			let bytes = copy_one_direction(
+				ReadError { kind: std::io::ErrorKind::NotConnected },
+				tokio::io::sink(),
+				activity,
+				None,
+			).await.unwrap();
+			assert_eq!(bytes, 0);
+
+			for kind in [
+				std::io::ErrorKind::NotConnected,
+				std::io::ErrorKind::ConnectionReset,
+			] {
+				let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
+				let bytes = copy_one_direction(
+					tokio::io::empty(),
+					ClosedStreamShutdownWriter { kind },
+					activity,
+					None,
+				).await.unwrap();
+				assert_eq!(bytes, 0);
+			}
+
+			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
+			let error = copy_one_direction(
+				ReadError { kind: std::io::ErrorKind::ConnectionReset },
+				tokio::io::sink(),
+				activity,
+				None,
+			).await.unwrap_err();
+			assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
 		});
 	}
 
