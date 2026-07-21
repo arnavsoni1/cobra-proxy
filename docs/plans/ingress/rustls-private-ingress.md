@@ -183,8 +183,9 @@ into a dependency-driven rewrite.
    mapping in the account store; do not treat a mutable certificate subject as
    the account identifier.
 5. Record the systemd, firewall, cloud-security-group, IPv4/IPv6, management,
-   and certificate-renewal facts required by
-   `FIREWALL_EGRESS_HARDENING.md` before any production firewall change.
+   and certificate-renewal facts required by the
+   [firewall egress-hardening plan](../firewall/egress-hardening.md) before any
+   production firewall change.
 
 **Exit gate:** a reviewed protocol document includes an example client command,
 the trust model, revocation/rotation procedure, and exact production port.
@@ -282,9 +283,10 @@ tunnel exhaustion all fail predictably without process growth or direct egress.
 2. The host firewall/cloud firewall may expose only the chosen TLS ingress port
    and approved management access. Do not expose 8080, 8081, 9090, Arti, or
    internal Unix sockets.
-3. Keep the proxy-to-Arti fail-closed egress work described in
-   `FIREWALL_EGRESS_HARDENING.md` independent of TLS termination. TLS ingress
-   does not prevent direct egress leaks.
+3. Keep the proxy-to-Arti fail-closed egress work described in the
+   [firewall egress-hardening plan](../firewall/egress-hardening.md)
+   independent of TLS termination. TLS ingress does not prevent direct egress
+   leaks.
 4. Add an explicit reload path (for example, systemd `ExecReload` plus signal
    handling) that validates replacement certificates before atomically swapping
    the configuration. Existing TLS connections must drain normally; only new
@@ -376,7 +378,7 @@ Tokio, Pingora, `http`, or `httparse` primitive underneath.
 | Destination circuit breaker | `CircuitBreaker`, `src/main.rs:220-298` | Circuit-breaker crates exist, but bounded destination keys, cooldown, and error categories are product policy. | **Retain initially.** Re-evaluate only after a measurable operational need. |
 | CONNECT lifecycle/error mapping and only-after-connect `200` | `handle_connect_request`, `src/main.rs:1859-1984` | No generic crate combines this with Tor, admission, isolation, and privacy-safe metrics. | **Keep manual.** Make stream type generic for TLS ingress. |
 | Private Unix bridge socket creation and permissions | `src/main.rs:1655-1666` | Tokio provides Unix sockets; Unix permissions come from the standard library/OS. | **Retain.** Do not expose or replace it during ingress work. |
-| Embedded Arti bootstrap and dedicated runtime | `TorCircuit`, `src/main.rs:1293-1328` | Arti provides the client; systemd can supervise a separate service later. | **Out of ingress scope.** Follow `FIREWALL_EGRESS_HARDENING.md` for the separate-process migration. |
+| Embedded Arti bootstrap and dedicated runtime | `TorCircuit`, `src/main.rs:1293-1328` | Arti provides the client; systemd can supervise a separate service later. | **Out of ingress scope.** Follow the [firewall egress-hardening plan](../firewall/egress-hardening.md) for the separate-process migration. |
 | Configuration through compile-time constants | `src/main.rs:50-87` | `serde`/`toml`/`figment`/`clap` can parse config, but no crate supplies safe defaults. | **Replace with a small typed config layer in this migration.** Keep secrets in owner-only files, not command-line arguments. |
 | Unit tests and controlled-origin test matrix | `src/main.rs:2099+`, test scripts | Tokio test utilities and Rust’s test harness are already sufficient. | **Extend tests; no test framework change is needed.** |
 
@@ -414,7 +416,7 @@ observed or retained.
   isolation strings as Prometheus labels or default log fields.
 - Do not activate firewall rules or production certificate issuance from a code
   change without the deployment facts, rollback plan, and explicit approval
-  required by `FIREWALL_EGRESS_HARDENING.md`.
+  required by the [firewall egress-hardening plan](../firewall/egress-hardening.md).
 
 ## Definition of done
 
