@@ -10,6 +10,7 @@ The scripts themselves remain the source of truth for exact defaults. Run a scri
 |---|---|---|---:|---:|
 | Fast compiler feedback | `cargo check --locked` | During editing | No | Cargo output only |
 | Deterministic automated tests | `cargo test --locked` | During editing and before every merge | No, ignored live tests are not run | Cargo output only |
+| Hosted Ubuntu CI | `.github/workflows/linux.yml` | Every push, pull request, or manual dispatch | No | GitHub Actions logs and cache |
 | Linux native smoke test | `./test-proxy-linux.sh` | Before shipping Linux changes | Yes | No |
 | macOS native smoke test | `./test-proxy-macos.sh` | Check the macOS development path | Yes | No |
 | Windows compatibility check | `test-proxy-windows.cmd` or `test-proxy-windows.ps1` | Detect native Windows support gaps | Only if compilation succeeds | No |
@@ -95,6 +96,12 @@ Run the deployment test against the exact release binary and environment that wi
 Do not promote a release based only on unit tests, a Tor Check response, or an in-memory benchmark.
 
 ## Rust compiler and automated tests
+
+### Hosted Ubuntu CI
+
+GitHub Actions runs `.github/workflows/linux.yml` on Ubuntu 24.04 for every push and pull request, and it can also be started manually with `workflow_dispatch`. The job installs the current stable Rust toolchain, checks all targets against the locked dependency graph, runs the deterministic test suite, and builds the release binary.
+
+The hosted job deliberately does not run `test-proxy-linux.sh`. That script depends on live Tor bootstrap and an external Tor Check endpoint, so it remains an explicit smoke test rather than a required merge check. A passing hosted job proves that the project compiles, tests, and release-builds on a clean Ubuntu runner; it does not validate Tor reachability, host firewall rules, public ingress, or a deployed service manager.
 
 ### Compiler check
 
