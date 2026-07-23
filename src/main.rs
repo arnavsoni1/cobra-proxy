@@ -11,6 +11,8 @@ use pingora::{
 	apps::HttpServerOptions,
 	protocols::http::ServerSession,
 	proxy::{Session, ProxyHttp, ProxyServiceBuilder},
+	server::{configuration::ServerConf, ShutdownWatch},
+	services::background::BackgroundService,
 	Error,
 	upstreams::peer::Proxy as CrateProxy,
 };
@@ -73,6 +75,8 @@ const CIRCUIT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10); // tune later
 const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = 1;
+const GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: u64 = 1;
 const RETRY_BACKOFF_MIN_MS: u64 = 50;
 const RETRY_BACKOFF_JITTER_MS: u64 = 100;
 const BREAKER_FAILURE_THRESHOLD: usize = 3;
@@ -1295,6 +1299,20 @@ pub struct TorCircuit {
 	client: Arc<TorClient<PreferredRuntime>>,
 }
 
+struct BridgeShutdown {
+	shutdown: watch::Sender<bool>,
+}
+
+#[async_trait]
+impl BackgroundService for BridgeShutdown {
+	async fn start(&self, mut shutdown: ShutdownWatch) {
+		if !*shutdown.borrow() {
+			let _ = shutdown.changed().await;
+		}
+		let _ = self.shutdown.send(true);
+	}
+}
+
 impl TorCircuit {
 	pub fn bootstrap(config: TorClientConfig) -> anyhow::Result<Self> {
 		let runtime = Runtime::new()
@@ -1317,13 +1335,18 @@ impl TorCircuit {
 		&self,
 		token_store: Arc<IsolationStore>,
 		metrics: Arc<CircuitMetrics>,
-	) {
+	) -> BridgeShutdown {
 		let tor = self.client();
+		let (shutdown, shutdown_receiver) = watch::channel(false);
 		self.runtime.spawn(async move {
-			if let Err(_error) = Bridge::new(tor, token_store, metrics).run_bridge().await {
+			if let Err(_error) = Bridge::new(tor, token_store, metrics)
+				.run_bridge(shutdown_receiver)
+				.await
+			{
 				eprintln!("{{\"event\":\"bridge_shutdown\",\"error\":true}}");
 			}
 		});
+		BridgeShutdown { shutdown }
 	}
 }
 
@@ -1652,7 +1675,7 @@ impl Bridge {
 		}
 	}
 	
-	pub async fn run_bridge(self) -> anyhow::Result<()> {
+	pub async fn run_bridge(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
 		match std::fs::remove_file(BRIDGE_SOCKET) {
 			Ok(()) => {}
 			Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1666,55 +1689,48 @@ impl Bridge {
 		}
 		let public_listener = TcpListener::bind(PUBLIC_PROXY_ADDR).await?;
 		let prometheus_listener = TcpListener::bind(PROMETHEUS_ADDR).await?;
-		let prometheus_metrics = self.circuit_metrics.clone();
-		let prometheus_tokens = self.token_store.clone();
-		let prometheus_breaker = self.circuit_breaker.clone();
-		tokio::spawn(async move {
-			loop {
-				match prometheus_listener.accept().await {
+		let mut interval = tokio::time::interval(CIRCUIT_METRICS_LOG_INTERVAL);
+		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+		// Tokio intervals tick immediately once; consume that tick so metrics are periodic.
+		interval.tick().await;
+
+		loop {
+			tokio::select! {
+				biased;
+				changed = shutdown.changed() => {
+					if changed.is_err() || *shutdown.borrow() {
+						break;
+					}
+				}
+				accepted = prometheus_listener.accept() => match accepted {
 					Ok((stream, _)) => {
-						let metrics = prometheus_metrics.clone();
-						let tokens = prometheus_tokens.clone();
-						let breaker = prometheus_breaker.clone();
+						let metrics = self.circuit_metrics.clone();
+						let tokens = self.token_store.clone();
+						let breaker = self.circuit_breaker.clone();
 						tokio::spawn(async move {
 							let _ = serve_prometheus_connection(stream, metrics, tokens, breaker).await;
 						});
 					}
 					Err(_) => eprintln!("{{\"event\":\"metrics_accept_error\"}}"),
+				},
+				_ = interval.tick() => {
+					self.circuit_metrics.log(&self.circuit_semaphore);
 				}
-			}
-		});
-		let circuit_semaphore = self.circuit_semaphore.clone();
-		let circuit_metrics = self.circuit_metrics.clone();
-		tokio::spawn(async move {
-			let mut interval = tokio::time::interval(CIRCUIT_METRICS_LOG_INTERVAL);
-			interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-			// Tokio intervals tick immediately once; consume that tick so metrics are periodic.
-			interval.tick().await;
-			loop {
-				interval.tick().await;
-				circuit_metrics.log(&circuit_semaphore);
-			}
-		});
-
-		let internal_bridge = self.clone();
-		tokio::spawn(async move {
-			loop {
-				match listener.accept().await {
+				accepted = listener.accept() => match accepted {
 					Ok((mut stream, _)) => {
-						let connection_permit = match internal_bridge
+						let connection_permit = match self
 							.connection_semaphore
 							.clone()
 							.try_acquire_owned()
 						{
 							Ok(permit) => permit,
 							Err(_) => {
-								internal_bridge.circuit_metrics.rejected_tunnels.fetch_add(1, Ordering::Relaxed);
+								self.circuit_metrics.rejected_tunnels.fetch_add(1, Ordering::Relaxed);
 								let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
 								continue;
 							}
 						};
-						let bridge = internal_bridge.clone();
+						let bridge = self.clone();
 						tokio::spawn(async move {
 							let _connection_permit = connection_permit;
 							if let Err(error) = bridge.handle_internal_connect(stream).await {
@@ -1723,32 +1739,40 @@ impl Bridge {
 						});
 					}
 					Err(_) => eprintln!("{{\"event\":\"bridge_accept_error\"}}"),
+					},
+					accepted = public_listener.accept() => match accepted {
+						Ok((mut stream, _)) => {
+							let connection_permit = match self.connection_semaphore.clone().try_acquire_owned() {
+								Ok(permit) => permit,
+								Err(_) => {
+									self.circuit_metrics.rejected_tunnels.fetch_add(1, Ordering::Relaxed);
+									let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
+									continue;
+								}
+							};
+							let bridge = self.clone();
+							tokio::spawn(async move {
+								let _connection_permit = connection_permit;
+								if let Err(error) = bridge.handle_public_connection(stream).await {
+									eprintln!("[bridge] ingress connection error: {error:#}");
+								}
+							});
+						}
+						Err(_) => eprintln!("{{\"event\":\"ingress_accept_error\"}}"),
+					},
 				}
 			}
-		});
 
-		loop {
-			match public_listener.accept().await {
-				Ok((mut stream, _)) => {
-					let connection_permit = match self.connection_semaphore.clone().try_acquire_owned() {
-						Ok(permit) => permit,
-						Err(_) => {
-							self.circuit_metrics.rejected_tunnels.fetch_add(1, Ordering::Relaxed);
-							let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
-							continue;
-						}
-					};
-					let bridge = self.clone();
-					tokio::spawn(async move {
-						let _connection_permit = connection_permit;
-						if let Err(error) = bridge.handle_public_connection(stream).await {
-							eprintln!("[bridge] ingress connection error: {error:#}");
-						}
-					});
-				}
-				Err(_) => eprintln!("{{\"event\":\"ingress_accept_error\"}}"),
-			}
+		drop(listener);
+		drop(public_listener);
+		drop(prometheus_listener);
+		match std::fs::remove_file(BRIDGE_SOCKET) {
+			Ok(()) => {}
+			Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
+			Err(error) => eprintln!("[bridge] failed to remove socket during shutdown: {error}"),
 		}
+		eprintln!("{{\"event\":\"bridge_shutdown\",\"error\":false}}");
+		Ok(())
 	}
 
 	async fn handle_public_connection(&self, mut stream: TcpStream) -> anyhow::Result<()> {
@@ -2044,6 +2068,15 @@ impl Bridge {
 // 	}
 // }
 
+fn proxy_server_configuration() -> anyhow::Result<ServerConf> {
+	let mut configuration = ServerConf::new()
+		.ok_or_else(|| anyhow::anyhow!("failed to create Pingora server configuration"))?;
+	configuration.grace_period_seconds = Some(SHUTDOWN_GRACE_PERIOD_SECONDS);
+	configuration.graceful_shutdown_timeout_seconds =
+		Some(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS);
+	Ok(configuration)
+}
+
 //#[tokio::main]
 fn main() -> Result<()> {
 	let config = TorClientConfig::default();
@@ -2065,18 +2098,18 @@ fn main() -> Result<()> {
 	
 	let token_store = Arc::new(IsolationStore::new(MAX_ISOLATION_TOKENS, ISOLATION_TOKEN_TTL));
 	let metrics = Arc::new(CircuitMetrics::default());
-	tor_circuit.start_bridge(token_store.clone(), metrics.clone());
+	let bridge_shutdown = tor_circuit.start_bridge(token_store.clone(), metrics.clone());
 	
-	let mut server =  match Server::new(None) {
-		Ok(s) => {
-			s
-		}
-		Err(e) => {
-			eprintln!("{}", e);
+	let server_configuration = match proxy_server_configuration() {
+		Ok(configuration) => configuration,
+		Err(error) => {
+			eprintln!("{error}");
 			process::exit(1);
 		}
 	};
+	let mut server = Server::new_with_opt_and_conf(None, server_configuration);
 	server.bootstrap();
+	server.add_service(background_service("bridge shutdown", bridge_shutdown));
 	
 	let mut http_options = HttpServerOptions::default();
 	http_options.allow_connect_method_proxying = false;
@@ -2104,11 +2137,13 @@ mod tests {
 		copy_bidirectional_with_idle_timeout, copy_bidirectional_with_idle_timeout_and_counters,
 		copy_one_direction,
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
-		render_prometheus_metrics, request_cache_eligible, resolve_isolation,
+		proxy_server_configuration, render_prometheus_metrics, request_cache_eligible, resolve_isolation,
 		serve_prometheus_connection, take_isolation_request, CircuitBreaker, CircuitMetrics,
-		ConnectFailure, IsolationRequest, IsolationStore, PUBLIC_PROXY_ADDR,
+		BridgeShutdown, ConnectFailure, IsolationRequest, IsolationStore, PUBLIC_PROXY_ADDR,
+		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_PERIOD_SECONDS,
 	};
 	use pingora::prelude::{RequestHeader, ResponseHeader};
+	use pingora::services::background::BackgroundService;
 	use std::sync::{
 		atomic::{AtomicUsize, Ordering},
 		Arc, Mutex,
@@ -2121,7 +2156,7 @@ mod tests {
 	use tokio::{
 		io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 		runtime::Runtime,
-		sync::Semaphore,
+		sync::{watch, Semaphore},
 		time::{timeout, Duration, Instant},
 	};
 
@@ -2223,6 +2258,48 @@ mod tests {
 			.insert_header(http::header::CACHE_CONTROL, cache_control)
 			.unwrap();
 		response
+	}
+
+	#[test]
+	fn shutdown_configuration_is_bounded() {
+		let configuration = proxy_server_configuration().unwrap();
+
+		assert_eq!(
+			configuration.grace_period_seconds,
+			Some(SHUTDOWN_GRACE_PERIOD_SECONDS)
+		);
+		assert_eq!(
+			configuration.graceful_shutdown_timeout_seconds,
+			Some(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)
+		);
+		assert!(
+			SHUTDOWN_GRACE_PERIOD_SECONDS
+				+ GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS.saturating_mul(2)
+				< 5,
+			"shutdown must finish within the deployment runner's five-second deadline"
+		);
+	}
+
+	#[test]
+	fn bridge_shutdown_follows_pingora_shutdown() {
+		Runtime::new().unwrap().block_on(async {
+			let (server_shutdown, server_shutdown_receiver) = watch::channel(false);
+			let (bridge_shutdown, mut bridge_shutdown_receiver) = watch::channel(false);
+			let relay = BridgeShutdown { shutdown: bridge_shutdown };
+			let relaying = tokio::spawn(async move {
+				relay.start(server_shutdown_receiver).await;
+			});
+
+			server_shutdown.send(true).unwrap();
+			timeout(
+				Duration::from_millis(250),
+				bridge_shutdown_receiver.wait_for(|requested| *requested),
+			)
+			.await
+			.expect("bridge should receive the server shutdown signal")
+			.expect("bridge shutdown sender should remain available");
+			relaying.await.unwrap();
+		});
 	}
 
 	#[test]
