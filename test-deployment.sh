@@ -14,6 +14,9 @@ https_test_url="${PROXY_TEST_HTTPS_URL:-https://example.com/}"
 cache_test_url="${PROXY_TEST_CACHEABLE_URL:-}"
 startup_timeout_seconds="${PROXY_START_TIMEOUT_SECONDS:-180}"
 request_timeout_seconds="${PROXY_REQUEST_TIMEOUT_SECONDS:-120}"
+local_shutdown_drain_seconds="${PROXY_TEST_SHUTDOWN_DRAIN_SECONDS:-1}"
+local_shutdown_force_stop_seconds="${PROXY_TEST_SHUTDOWN_FORCE_STOP_SECONDS:-1}"
+local_shutdown_wait_seconds=""
 skip_build=0
 keep_running=0
 artifacts_dir=""
@@ -128,6 +131,12 @@ if [[ ! "$request_timeout_seconds" =~ ^[1-9][0-9]*$ ]]; then
 	echo "error: --request-timeout must be a positive integer" >&2
 	exit 2
 fi
+if [[ ! "$local_shutdown_drain_seconds" =~ ^[1-9][0-9]*$ ]] ||
+	[[ ! "$local_shutdown_force_stop_seconds" =~ ^[1-9][0-9]*$ ]]; then
+	echo "error: test shutdown drain and force-stop values must be positive integers" >&2
+	exit 2
+fi
+local_shutdown_wait_seconds=$((local_shutdown_drain_seconds + local_shutdown_force_stop_seconds + 5))
 if [[ "$proxy_url" != http://* && "$proxy_url" != https://* ]]; then
 	echo "error: --proxy-url must be an HTTP(S) URL" >&2
 	exit 2
@@ -208,7 +217,7 @@ stop_local_proxy() {
 
 	kill "$local_proxy_pid" 2>/dev/null || true
 	local attempt
-	for attempt in {1..50}; do
+	for ((attempt = 0; attempt < local_shutdown_wait_seconds * 10; attempt++)); do
 		if ! kill -0 "$local_proxy_pid" 2>/dev/null; then
 			break
 		fi
@@ -317,7 +326,9 @@ start_local_proxy_case() {
 		echo "release binary not found or not executable: $binary" >&2
 		return 1
 	fi
-	"$binary" >"$proxy_log" 2>&1 &
+	PROXY_SHUTDOWN_DRAIN_SECONDS="$local_shutdown_drain_seconds" \
+		PROXY_SHUTDOWN_FORCE_STOP_SECONDS="$local_shutdown_force_stop_seconds" \
+		"$binary" >"$proxy_log" 2>&1 &
 	local_proxy_pid=$!
 	local_proxy_started=1
 	echo "$local_proxy_pid" > "$artifacts_dir/proxy.pid"
@@ -363,6 +374,7 @@ metrics_contract_case() {
 		--output "$metrics_before" || return 1
 	for metric_name in \
 		proxy_active_tunnels \
+		proxy_bridge_tasks_active \
 		proxy_requests_total \
 		proxy_bytes_to_tor_total \
 		proxy_bytes_from_tor_total \

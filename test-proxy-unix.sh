@@ -85,7 +85,9 @@ cargo test --locked
 cargo build --release --locked
 
 echo "==> Starting proxy"
-"$script_dir/target/release/proxy" >"$proxy_log" 2>&1 &
+PROXY_SHUTDOWN_DRAIN_SECONDS="${PROXY_TEST_SHUTDOWN_DRAIN_SECONDS:-1}" \
+	PROXY_SHUTDOWN_FORCE_STOP_SECONDS="${PROXY_TEST_SHUTDOWN_FORCE_STOP_SECONDS:-1}" \
+	"$script_dir/target/release/proxy" >"$proxy_log" 2>&1 &
 proxy_pid=$!
 wait_for_proxy
 
@@ -134,4 +136,3 @@ fi
 
 echo "==> Native $expected_os smoke test passed"
 grep 'circuit metrics:' "$proxy_log" | tail -n 3
-

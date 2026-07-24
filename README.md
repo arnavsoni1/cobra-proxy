@@ -60,6 +60,33 @@ At startup, the service creates a dedicated asynchronous runtime and bootstraps 
 
 The Tor bridge and its metrics service run as asynchronous tasks. Pingora runs the internal HTTP service and uses the protected Unix socket whenever it needs an outbound Tor connection. A bootstrap failure stops startup rather than silently allowing direct network access.
 
+### Bounded task draining
+
+The bridge owns its public-ingress, internal-bridge, and metrics connection
+tasks in one task registry. Because Tor connection establishment and tunnel
+copying are awaited inside those connection tasks, their complete lifetime is
+covered by the same ownership boundary.
+
+On graceful termination, the listeners close first and the registry allows
+owned tasks to finish naturally. The default drain period is 30 seconds. Tasks
+remaining at the deadline are aborted, which drops their streams and
+cancellation-safe admission guards, and the process waits up to another five
+seconds for their termination. Shutdown logs and Prometheus metrics distinguish
+normal completion, failure, deadline cancellation, and a force-stop timeout.
+
+The two positive integer environment variables below configure this behavior.
+Each accepts a value from 1 through 3600 seconds:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `PROXY_SHUTDOWN_DRAIN_SECONDS` | `30` | Natural completion window for owned bridge tasks |
+| `PROXY_SHUTDOWN_FORCE_STOP_SECONDS` | `5` | Maximum wait for deadline-aborted tasks to terminate |
+
+Pingora's grace period is derived from both values plus a safety margin, so a
+service supervisor must allow more than the combined application budget before
+sending `SIGKILL`. Local test runners use shorter, test-only values; they do not
+change the production defaults.
+
 ### Public ingress and protocol dispatch
 
 The ingress listener reads a bounded HTTP header without discarding bytes that may already belong to a tunneled protocol.

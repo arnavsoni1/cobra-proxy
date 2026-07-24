@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod private_ingress;
+
 use pingora::{
 	prelude::*, 
 	cache::{
@@ -19,6 +22,7 @@ use pingora::{
 use async_trait::async_trait;
 use std::{
 	collections::HashMap,
+	future::Future,
 	process,
 	net::IpAddr,
 	sync::{
@@ -44,6 +48,7 @@ use tokio::{
 	runtime::Runtime, 
 	net::{TcpListener, TcpStream, UnixListener, UnixStream},
 	sync::{watch, OwnedSemaphorePermit, Semaphore},
+	task::{JoinError, JoinSet},
 	time::Duration
 	//sync::{Semaphore, SemaphorePermit}
 };
@@ -75,7 +80,10 @@ const CIRCUIT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10); // tune later
 const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const SHUTDOWN_GRACE_PERIOD_SECONDS: u64 = 1;
+const DEFAULT_BRIDGE_TASK_DRAIN_SECONDS: u64 = 30;
+const DEFAULT_BRIDGE_TASK_FORCE_STOP_SECONDS: u64 = 5;
+const MAX_BRIDGE_TASK_SHUTDOWN_SECONDS: u64 = 60 * 60;
+const SHUTDOWN_GRACE_MARGIN_SECONDS: u64 = 1;
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: u64 = 1;
 const RETRY_BACKOFF_MIN_MS: u64 = 50;
 const RETRY_BACKOFF_JITTER_MS: u64 = 100;
@@ -813,6 +821,11 @@ struct CircuitMetrics {
 	cache_insertions: AtomicU64,
 	upstream_reused: AtomicU64,
 	upstream_fresh: AtomicU64,
+	bridge_tasks_active: AtomicUsize,
+	bridge_tasks_completed: AtomicU64,
+	bridge_tasks_failed: AtomicU64,
+	bridge_tasks_deadline_cancelled: AtomicU64,
+	bridge_tasks_force_aborted: AtomicU64,
 }
 
 impl CircuitMetrics {
@@ -876,6 +889,270 @@ impl<'a> AtomicGaugeGuard<'a> {
 impl Drop for AtomicGaugeGuard<'_> {
 	fn drop(&mut self) {
 		self.counter.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BridgeTaskDrainConfig {
+	drain_timeout: Duration,
+	force_stop_timeout: Duration,
+}
+
+impl BridgeTaskDrainConfig {
+	fn new(drain_timeout: Duration, force_stop_timeout: Duration) -> anyhow::Result<Self> {
+		if drain_timeout.is_zero() {
+			anyhow::bail!("bridge task drain timeout must be positive");
+		}
+		if force_stop_timeout.is_zero() {
+			anyhow::bail!("bridge task force-stop timeout must be positive");
+		}
+		if drain_timeout > Duration::from_secs(MAX_BRIDGE_TASK_SHUTDOWN_SECONDS) {
+			anyhow::bail!(
+				"bridge task drain timeout cannot exceed {MAX_BRIDGE_TASK_SHUTDOWN_SECONDS} seconds"
+			);
+		}
+		if force_stop_timeout > Duration::from_secs(MAX_BRIDGE_TASK_SHUTDOWN_SECONDS) {
+			anyhow::bail!(
+				"bridge task force-stop timeout cannot exceed {MAX_BRIDGE_TASK_SHUTDOWN_SECONDS} seconds"
+			);
+		}
+		Ok(Self { drain_timeout, force_stop_timeout })
+	}
+
+	fn from_environment() -> anyhow::Result<Self> {
+		let drain_seconds = shutdown_seconds_from_environment(
+			"PROXY_SHUTDOWN_DRAIN_SECONDS",
+			DEFAULT_BRIDGE_TASK_DRAIN_SECONDS,
+		)?;
+		let force_stop_seconds = shutdown_seconds_from_environment(
+			"PROXY_SHUTDOWN_FORCE_STOP_SECONDS",
+			DEFAULT_BRIDGE_TASK_FORCE_STOP_SECONDS,
+		)?;
+		Self::new(
+			Duration::from_secs(drain_seconds),
+			Duration::from_secs(force_stop_seconds),
+		)
+	}
+
+	fn pingora_grace_period_seconds(&self) -> anyhow::Result<u64> {
+		self.drain_timeout
+			.as_secs()
+			.checked_add(self.force_stop_timeout.as_secs())
+			.and_then(|seconds| seconds.checked_add(SHUTDOWN_GRACE_MARGIN_SECONDS))
+			.ok_or_else(|| anyhow::anyhow!("bridge shutdown budget exceeds the supported range"))
+	}
+}
+
+fn shutdown_seconds_from_environment(name: &str, default: u64) -> anyhow::Result<u64> {
+	match std::env::var(name) {
+		Ok(raw) => {
+			let seconds = raw
+				.parse::<u64>()
+				.map_err(|_| anyhow::anyhow!("{name} must be a positive integer number of seconds"))?;
+			if seconds == 0 || seconds > MAX_BRIDGE_TASK_SHUTDOWN_SECONDS {
+				anyhow::bail!(
+					"{name} must be between 1 and {MAX_BRIDGE_TASK_SHUTDOWN_SECONDS} seconds"
+				);
+			}
+			Ok(seconds)
+		}
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => {
+			anyhow::bail!("{name} must contain valid Unicode")
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeTaskKind {
+	Metrics,
+	Internal,
+	Public,
+}
+
+impl BridgeTaskKind {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Metrics => "metrics",
+			Self::Internal => "internal",
+			Self::Public => "public",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeTaskOutcome {
+	Completed(BridgeTaskKind),
+	Failed(BridgeTaskKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeTaskCompletion {
+	Completed,
+	Failed,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BridgeDrainSummary {
+	completed: usize,
+	failed: usize,
+	deadline_cancelled: usize,
+	force_aborted: usize,
+	deadline_reached: bool,
+	termination_confirmed: bool,
+	elapsed: Duration,
+}
+
+impl BridgeDrainSummary {
+	fn observe(&mut self, completion: BridgeTaskCompletion) {
+		match completion {
+			BridgeTaskCompletion::Completed => self.completed = self.completed.saturating_add(1),
+			BridgeTaskCompletion::Failed => self.failed = self.failed.saturating_add(1),
+		}
+	}
+}
+
+struct BridgeTaskGaugeGuard {
+	metrics: Arc<CircuitMetrics>,
+}
+
+impl BridgeTaskGaugeGuard {
+	fn increment(metrics: Arc<CircuitMetrics>) -> Self {
+		metrics.bridge_tasks_active.fetch_add(1, Ordering::Relaxed);
+		Self { metrics }
+	}
+}
+
+impl Drop for BridgeTaskGaugeGuard {
+	fn drop(&mut self) {
+		self.metrics.bridge_tasks_active.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+struct BridgeTaskRegistry {
+	tasks: JoinSet<BridgeTaskOutcome>,
+	metrics: Arc<CircuitMetrics>,
+}
+
+impl BridgeTaskRegistry {
+	fn new(metrics: Arc<CircuitMetrics>) -> Self {
+		Self {
+			tasks: JoinSet::new(),
+			metrics,
+		}
+	}
+
+	fn spawn<F>(&mut self, kind: BridgeTaskKind, task: F)
+	where
+		F: Future<Output = anyhow::Result<()>> + Send + 'static,
+	{
+		let active_guard = BridgeTaskGaugeGuard::increment(self.metrics.clone());
+		self.tasks.spawn(async move {
+			let _active_guard = active_guard;
+			match task.await {
+				Ok(()) => BridgeTaskOutcome::Completed(kind),
+				Err(_) => BridgeTaskOutcome::Failed(kind),
+			}
+		});
+	}
+
+	fn is_empty(&self) -> bool {
+		self.tasks.is_empty()
+	}
+
+	async fn join_next(&mut self) -> Option<Result<BridgeTaskOutcome, JoinError>> {
+		self.tasks.join_next().await
+	}
+
+	fn record_join(
+		&self,
+		joined: Result<BridgeTaskOutcome, JoinError>,
+	) -> BridgeTaskCompletion {
+		match joined {
+			Ok(BridgeTaskOutcome::Completed(_kind)) => {
+				self.metrics.bridge_tasks_completed.fetch_add(1, Ordering::Relaxed);
+				BridgeTaskCompletion::Completed
+			}
+			Ok(BridgeTaskOutcome::Failed(kind)) => {
+				self.metrics.bridge_tasks_failed.fetch_add(1, Ordering::Relaxed);
+				eprintln!(
+					"{{\"event\":\"bridge_task\",\"kind\":\"{}\",\"outcome\":\"failed\"}}",
+					kind.as_str()
+				);
+				BridgeTaskCompletion::Failed
+			}
+			Err(error) => {
+				self.metrics.bridge_tasks_failed.fetch_add(1, Ordering::Relaxed);
+				let reason = if error.is_panic() { "panic" } else { "cancelled" };
+				eprintln!(
+					"{{\"event\":\"bridge_task\",\"kind\":\"unknown\",\"outcome\":\"failed\",\"reason\":\"{reason}\"}}"
+				);
+				BridgeTaskCompletion::Failed
+			}
+		}
+	}
+
+	async fn drain(&mut self, config: BridgeTaskDrainConfig) -> BridgeDrainSummary {
+		let started = tokio::time::Instant::now();
+		let mut summary = BridgeDrainSummary {
+			termination_confirmed: true,
+			..BridgeDrainSummary::default()
+		};
+		while let Some(joined) = self.tasks.try_join_next() {
+			summary.observe(self.record_join(joined));
+		}
+		if self.tasks.is_empty() {
+			summary.elapsed = started.elapsed();
+			return summary;
+		}
+
+		let drain_deadline = tokio::time::sleep(config.drain_timeout);
+		tokio::pin!(drain_deadline);
+		loop {
+			if self.tasks.is_empty() {
+				break;
+			}
+			tokio::select! {
+				biased;
+				joined = self.tasks.join_next() => {
+					if let Some(joined) = joined {
+						summary.observe(self.record_join(joined));
+					}
+				}
+				_ = &mut drain_deadline => {
+					summary.deadline_reached = true;
+					break;
+				}
+			}
+		}
+
+		while let Some(joined) = self.tasks.try_join_next() {
+			summary.observe(self.record_join(joined));
+		}
+		if !self.tasks.is_empty() {
+			summary.deadline_cancelled = self.tasks.len();
+			self.metrics.bridge_tasks_deadline_cancelled.fetch_add(
+				summary.deadline_cancelled as u64,
+				Ordering::Relaxed,
+			);
+			self.tasks.abort_all();
+			let termination = async {
+				while self.tasks.join_next().await.is_some() {}
+			};
+			if tokio::time::timeout(config.force_stop_timeout, termination)
+				.await
+				.is_err()
+			{
+				summary.force_aborted = self.tasks.len();
+				summary.termination_confirmed = false;
+				self.metrics.bridge_tasks_force_aborted.fetch_add(
+					summary.force_aborted as u64,
+					Ordering::Relaxed,
+				);
+			}
+		}
+		summary.elapsed = started.elapsed();
+		summary
 	}
 }
 
@@ -993,6 +1270,11 @@ fn render_prometheus_metrics(
 	metric!("proxy_cache_evicted_bytes_total", "Bytes evicted by the LRU manager.", "counter", cache_eviction().evicted_size());
 	metric!("proxy_upstream_connections_reused_total", "HTTP requests reusing an upstream connection.", "counter", metrics.upstream_reused.load(Ordering::Relaxed));
 	metric!("proxy_upstream_connections_fresh_total", "HTTP requests using a newly established upstream connection.", "counter", metrics.upstream_fresh.load(Ordering::Relaxed));
+	metric!("proxy_bridge_tasks_active", "Currently owned bridge connection tasks.", "gauge", metrics.bridge_tasks_active.load(Ordering::Relaxed));
+	metric!("proxy_bridge_tasks_completed_total", "Owned bridge tasks that completed normally.", "counter", metrics.bridge_tasks_completed.load(Ordering::Relaxed));
+	metric!("proxy_bridge_tasks_failed_total", "Owned bridge tasks that failed or panicked.", "counter", metrics.bridge_tasks_failed.load(Ordering::Relaxed));
+	metric!("proxy_bridge_tasks_deadline_cancelled_total", "Owned bridge tasks cancelled at the natural drain deadline.", "counter", metrics.bridge_tasks_deadline_cancelled.load(Ordering::Relaxed));
+	metric!("proxy_bridge_tasks_force_aborted_total", "Owned bridge tasks whose termination exceeded the force-stop timeout.", "counter", metrics.bridge_tasks_force_aborted.load(Ordering::Relaxed));
 	metric!("proxy_isolation_tokens", "Current bounded isolation-token entries.", "gauge", token_store.len());
 	metric!("proxy_circuit_breaker_entries", "Current destination circuit-breaker entries.", "gauge", circuit_breaker.len());
 
@@ -1335,12 +1617,13 @@ impl TorCircuit {
 		&self,
 		token_store: Arc<IsolationStore>,
 		metrics: Arc<CircuitMetrics>,
+		drain_config: BridgeTaskDrainConfig,
 	) -> BridgeShutdown {
 		let tor = self.client();
 		let (shutdown, shutdown_receiver) = watch::channel(false);
 		self.runtime.spawn(async move {
 			if let Err(_error) = Bridge::new(tor, token_store, metrics)
-				.run_bridge(shutdown_receiver)
+				.run_bridge(shutdown_receiver, drain_config)
 				.await
 			{
 				eprintln!("{{\"event\":\"bridge_shutdown\",\"error\":true}}");
@@ -1675,7 +1958,11 @@ impl Bridge {
 		}
 	}
 	
-	pub async fn run_bridge(self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+	async fn run_bridge(
+		self,
+		mut shutdown: watch::Receiver<bool>,
+		drain_config: BridgeTaskDrainConfig,
+	) -> anyhow::Result<()> {
 		match std::fs::remove_file(BRIDGE_SOCKET) {
 			Ok(()) => {}
 			Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1693,6 +1980,7 @@ impl Bridge {
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 		// Tokio intervals tick immediately once; consume that tick so metrics are periodic.
 		interval.tick().await;
+		let mut task_registry = BridgeTaskRegistry::new(self.circuit_metrics.clone());
 
 		loop {
 			tokio::select! {
@@ -1702,13 +1990,20 @@ impl Bridge {
 						break;
 					}
 				}
+				joined = task_registry.join_next(), if !task_registry.is_empty() => {
+					if let Some(joined) = joined {
+						task_registry.record_join(joined);
+					}
+				}
 				accepted = prometheus_listener.accept() => match accepted {
 					Ok((stream, _)) => {
 						let metrics = self.circuit_metrics.clone();
 						let tokens = self.token_store.clone();
 						let breaker = self.circuit_breaker.clone();
-						tokio::spawn(async move {
-							let _ = serve_prometheus_connection(stream, metrics, tokens, breaker).await;
+						task_registry.spawn(BridgeTaskKind::Metrics, async move {
+							serve_prometheus_connection(stream, metrics, tokens, breaker)
+								.await
+								.map_err(anyhow::Error::from)
 						});
 					}
 					Err(_) => eprintln!("{{\"event\":\"metrics_accept_error\"}}"),
@@ -1731,11 +2026,13 @@ impl Bridge {
 							}
 						};
 						let bridge = self.clone();
-						tokio::spawn(async move {
+						task_registry.spawn(BridgeTaskKind::Internal, async move {
 							let _connection_permit = connection_permit;
-							if let Err(error) = bridge.handle_internal_connect(stream).await {
+							let result = bridge.handle_internal_connect(stream).await;
+							if let Err(error) = &result {
 								eprintln!("[bridge] internal connection error: {error:#}");
 							}
+							result
 						});
 					}
 					Err(_) => eprintln!("{{\"event\":\"bridge_accept_error\"}}"),
@@ -1751,11 +2048,13 @@ impl Bridge {
 								}
 							};
 							let bridge = self.clone();
-							tokio::spawn(async move {
+							task_registry.spawn(BridgeTaskKind::Public, async move {
 								let _connection_permit = connection_permit;
-								if let Err(error) = bridge.handle_public_connection(stream).await {
+								let result = bridge.handle_public_connection(stream).await;
+								if let Err(error) = &result {
 									eprintln!("[bridge] ingress connection error: {error:#}");
 								}
+								result
 							});
 						}
 						Err(_) => eprintln!("{{\"event\":\"ingress_accept_error\"}}"),
@@ -1766,12 +2065,22 @@ impl Bridge {
 		drop(listener);
 		drop(public_listener);
 		drop(prometheus_listener);
+		let drain_summary = task_registry.drain(drain_config).await;
 		match std::fs::remove_file(BRIDGE_SOCKET) {
 			Ok(()) => {}
 			Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {}
 			Err(error) => eprintln!("[bridge] failed to remove socket during shutdown: {error}"),
 		}
-		eprintln!("{{\"event\":\"bridge_shutdown\",\"error\":false}}");
+		eprintln!(
+			"{{\"event\":\"bridge_shutdown\",\"error\":{},\"drain_deadline_reached\":{},\"completed\":{},\"failed\":{},\"deadline_cancelled\":{},\"force_aborted\":{},\"elapsed_ms\":{}}}",
+			!drain_summary.termination_confirmed,
+			drain_summary.deadline_reached,
+			drain_summary.completed,
+			drain_summary.failed,
+			drain_summary.deadline_cancelled,
+			drain_summary.force_aborted,
+			drain_summary.elapsed.as_millis(),
+		);
 		Ok(())
 	}
 
@@ -2068,10 +2377,13 @@ impl Bridge {
 // 	}
 // }
 
-fn proxy_server_configuration() -> anyhow::Result<ServerConf> {
+fn proxy_server_configuration(
+	bridge_drain_config: BridgeTaskDrainConfig,
+) -> anyhow::Result<ServerConf> {
 	let mut configuration = ServerConf::new()
 		.ok_or_else(|| anyhow::anyhow!("failed to create Pingora server configuration"))?;
-	configuration.grace_period_seconds = Some(SHUTDOWN_GRACE_PERIOD_SECONDS);
+	configuration.grace_period_seconds =
+		Some(bridge_drain_config.pingora_grace_period_seconds()?);
 	configuration.graceful_shutdown_timeout_seconds =
 		Some(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS);
 	Ok(configuration)
@@ -2080,6 +2392,13 @@ fn proxy_server_configuration() -> anyhow::Result<ServerConf> {
 //#[tokio::main]
 fn main() -> Result<()> {
 	let config = TorClientConfig::default();
+	let bridge_drain_config = match BridgeTaskDrainConfig::from_environment() {
+		Ok(configuration) => configuration,
+		Err(error) => {
+			eprintln!("{error}");
+			process::exit(1);
+		}
+	};
 	//let tor_client = match TorClient::create_bootstrapped(config).await {
 	//	Ok(client) => client,
 	//	Err(e) => {
@@ -2098,9 +2417,13 @@ fn main() -> Result<()> {
 	
 	let token_store = Arc::new(IsolationStore::new(MAX_ISOLATION_TOKENS, ISOLATION_TOKEN_TTL));
 	let metrics = Arc::new(CircuitMetrics::default());
-	let bridge_shutdown = tor_circuit.start_bridge(token_store.clone(), metrics.clone());
+	let bridge_shutdown = tor_circuit.start_bridge(
+		token_store.clone(),
+		metrics.clone(),
+		bridge_drain_config,
+	);
 	
-	let server_configuration = match proxy_server_configuration() {
+	let server_configuration = match proxy_server_configuration(bridge_drain_config) {
 		Ok(configuration) => configuration,
 		Err(error) => {
 			eprintln!("{error}");
@@ -2139,8 +2462,9 @@ mod tests {
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
 		proxy_server_configuration, render_prometheus_metrics, request_cache_eligible, resolve_isolation,
 		serve_prometheus_connection, take_isolation_request, CircuitBreaker, CircuitMetrics,
-		BridgeShutdown, ConnectFailure, IsolationRequest, IsolationStore, PUBLIC_PROXY_ADDR,
-		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_PERIOD_SECONDS,
+		BridgeShutdown, BridgeTaskDrainConfig, BridgeTaskKind, BridgeTaskRegistry, ConnectFailure,
+		IsolationRequest, IsolationStore, PUBLIC_PROXY_ADDR,
+		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_MARGIN_SECONDS,
 	};
 	use pingora::prelude::{RequestHeader, ResponseHeader};
 	use pingora::services::background::BackgroundService;
@@ -2262,22 +2586,151 @@ mod tests {
 
 	#[test]
 	fn shutdown_configuration_is_bounded() {
-		let configuration = proxy_server_configuration().unwrap();
+		let drain_config = BridgeTaskDrainConfig::new(
+			Duration::from_secs(1),
+			Duration::from_secs(1),
+		).unwrap();
+		let configuration = proxy_server_configuration(drain_config).unwrap();
 
 		assert_eq!(
 			configuration.grace_period_seconds,
-			Some(SHUTDOWN_GRACE_PERIOD_SECONDS)
+			Some(2 + SHUTDOWN_GRACE_MARGIN_SECONDS)
 		);
 		assert_eq!(
 			configuration.graceful_shutdown_timeout_seconds,
 			Some(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)
 		);
+	}
+
+	#[test]
+	fn bridge_task_drain_configuration_rejects_unsafe_bounds() {
 		assert!(
-			SHUTDOWN_GRACE_PERIOD_SECONDS
-				+ GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS.saturating_mul(2)
-				< 5,
-			"shutdown must finish within the deployment runner's five-second deadline"
+			BridgeTaskDrainConfig::new(Duration::ZERO, Duration::from_secs(1)).is_err()
 		);
+		assert!(
+			BridgeTaskDrainConfig::new(Duration::from_secs(1), Duration::ZERO).is_err()
+		);
+		assert!(
+			BridgeTaskDrainConfig::new(
+				Duration::from_secs(super::MAX_BRIDGE_TASK_SHUTDOWN_SECONDS + 1),
+				Duration::from_secs(1),
+			)
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn bridge_task_registry_drains_completed_and_failed_tasks() {
+		Runtime::new().unwrap().block_on(async {
+			let metrics = Arc::new(CircuitMetrics::default());
+			let mut registry = BridgeTaskRegistry::new(metrics.clone());
+			registry.spawn(BridgeTaskKind::Public, async { Ok(()) });
+			registry.spawn(BridgeTaskKind::Metrics, async {
+				anyhow::bail!("deterministic task failure")
+			});
+
+			let summary = registry
+				.drain(
+					BridgeTaskDrainConfig::new(
+						Duration::from_millis(250),
+						Duration::from_millis(250),
+					)
+					.unwrap(),
+				)
+				.await;
+
+			assert_eq!(summary.completed, 1);
+			assert_eq!(summary.failed, 1);
+			assert_eq!(summary.deadline_cancelled, 0);
+			assert!(!summary.deadline_reached);
+			assert!(summary.termination_confirmed);
+			assert_eq!(metrics.bridge_tasks_active.load(Ordering::Relaxed), 0);
+			assert_eq!(metrics.bridge_tasks_completed.load(Ordering::Relaxed), 1);
+			assert_eq!(metrics.bridge_tasks_failed.load(Ordering::Relaxed), 1);
+		});
+	}
+
+	#[test]
+	fn bridge_task_registry_cancels_only_after_drain_deadline() {
+		Runtime::new().unwrap().block_on(async {
+			let metrics = Arc::new(CircuitMetrics::default());
+			let mut registry = BridgeTaskRegistry::new(metrics.clone());
+			registry.spawn(BridgeTaskKind::Internal, async {
+				std::future::pending::<()>().await;
+				Ok(())
+			});
+			let drain_timeout = Duration::from_millis(25);
+			let started = Instant::now();
+
+			let summary = registry
+				.drain(
+					BridgeTaskDrainConfig::new(
+						drain_timeout,
+						Duration::from_millis(250),
+					)
+					.unwrap(),
+				)
+				.await;
+
+			assert!(started.elapsed() >= drain_timeout);
+			assert!(summary.deadline_reached);
+			assert_eq!(summary.deadline_cancelled, 1);
+			assert_eq!(summary.force_aborted, 0);
+			assert!(summary.termination_confirmed);
+			assert_eq!(metrics.bridge_tasks_active.load(Ordering::Relaxed), 0);
+			assert_eq!(
+				metrics.bridge_tasks_deadline_cancelled.load(Ordering::Relaxed),
+				1
+			);
+		});
+	}
+
+	#[test]
+	fn bridge_task_registry_preserves_tunnel_half_closes_during_drain() {
+		Runtime::new().unwrap().block_on(async {
+			let metrics = Arc::new(CircuitMetrics::default());
+			let mut registry = BridgeTaskRegistry::new(metrics.clone());
+			let (mut downstream_client, mut downstream_bridge) = tokio::io::duplex(256);
+			let (mut upstream_bridge, mut upstream_server) = tokio::io::duplex(256);
+			registry.spawn(BridgeTaskKind::Public, async move {
+				copy_bidirectional_with_idle_timeout(
+					&mut downstream_bridge,
+					&mut upstream_bridge,
+					Duration::from_secs(1),
+				)
+				.await
+				.map(|_| ())
+				.map_err(anyhow::Error::from)
+			});
+
+			let draining = registry.drain(
+				BridgeTaskDrainConfig::new(
+					Duration::from_secs(1),
+					Duration::from_millis(250),
+				)
+				.unwrap(),
+			);
+			let traffic = async {
+				downstream_client.write_all(b"request").await.unwrap();
+				downstream_client.shutdown().await.unwrap();
+				let mut request = Vec::new();
+				upstream_server.read_to_end(&mut request).await.unwrap();
+				assert_eq!(request, b"request");
+
+				upstream_server.write_all(b"response").await.unwrap();
+				upstream_server.shutdown().await.unwrap();
+				let mut response = Vec::new();
+				downstream_client.read_to_end(&mut response).await.unwrap();
+				assert_eq!(response, b"response");
+			};
+			let (summary, ()) = tokio::join!(draining, traffic);
+
+			assert_eq!(summary.completed, 1);
+			assert_eq!(summary.deadline_cancelled, 0);
+			assert!(!summary.deadline_reached);
+			assert!(summary.termination_confirmed);
+			assert_eq!(metrics.bridge_tasks_active.load(Ordering::Relaxed), 0);
+		});
 	}
 
 	#[test]
@@ -2638,6 +3091,8 @@ mod tests {
 		metrics.record_request("GET", 200, Duration::from_millis(25));
 		metrics.cache_hits.store(2, Ordering::Relaxed);
 		metrics.bytes_to_tor.store(123, Ordering::Relaxed);
+		metrics.bridge_tasks_completed.store(4, Ordering::Relaxed);
+		metrics.bridge_tasks_deadline_cancelled.store(1, Ordering::Relaxed);
 		metrics.record_arti_failure("timeout");
 		let tokens = IsolationStore::new(2, Duration::from_secs(60));
 		tokens.material_for("private-session-name");
@@ -2649,6 +3104,8 @@ mod tests {
 		assert!(rendered.contains("proxy_requests_total{method=\"GET\",status=\"200\"} 1"));
 		assert!(rendered.contains("proxy_cache_hits_total 2"));
 		assert!(rendered.contains("proxy_bytes_to_tor_total 123"));
+		assert!(rendered.contains("proxy_bridge_tasks_completed_total 4"));
+		assert!(rendered.contains("proxy_bridge_tasks_deadline_cancelled_total 1"));
 		assert!(rendered.contains("proxy_arti_failures_total{class=\"timeout\"} 1"));
 		assert!(rendered.contains("proxy_isolation_tokens 1"));
 		assert!(!rendered.contains("private-session-name"));

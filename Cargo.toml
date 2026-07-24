@@ -11,5 +11,8 @@ http = "1.4.0"
 httparse = "1.10.1"
 pingora = { version = "0.8.0", features = ["proxy", "cache"] }
 pingora-memory-cache = "0.8.0"
+rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
 tokio = "1.52.3"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tor-rtcompat = "0.42.0"

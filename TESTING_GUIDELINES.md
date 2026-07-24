@@ -433,6 +433,15 @@ Run `./test-deployment.sh --help` for the current interface.
 
 Equivalent defaults can be set with `PROXY_URL`, `PROXY_METRICS_URL`, `TOR_CHECK_URL`, `PROXY_TEST_HTTP_URL`, `PROXY_TEST_HTTPS_URL`, `PROXY_TEST_CACHEABLE_URL`, `PROXY_START_TIMEOUT_SECONDS`, and `PROXY_REQUEST_TIMEOUT_SECONDS`. Explicit CLI options take precedence over environment defaults.
 
+For a local test-owned process, the deployment, Unix smoke, and stress runners set
+`PROXY_SHUTDOWN_DRAIN_SECONDS` and
+`PROXY_SHUTDOWN_FORCE_STOP_SECONDS` from the test-only
+`PROXY_TEST_SHUTDOWN_DRAIN_SECONDS` and
+`PROXY_TEST_SHUTDOWN_FORCE_STOP_SECONDS` inputs. Both test inputs default to
+one second so cleanup remains quick; the runner derives its exact-PID fallback
+deadline from them. These test defaults do not alter the binary's production
+defaults of a 30-second natural drain and a five-second force-stop wait.
+
 When `--keep-running` is selected, the evidence bundle contains `proxy.pid` and the final console output reports the PID. The developer is responsible for stopping that exact test-owned process. Without this option, cleanup allows a bounded graceful period and then force-stops only the PID the runner started.
 
 ### Deployment case matrix
