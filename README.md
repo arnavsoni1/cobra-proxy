@@ -13,25 +13,37 @@ The proxy accepts ordinary HTTP requests and HTTPS tunnels from a local client. 
 
 Two isolation modes are available:
 
-- **Session isolation** keeps traffic with the same caller-supplied isolation identity eligible to reuse the same isolation group. Different identities cannot share a circuit or a pooled upstream connection.
+- **Session isolation** keeps traffic in the same authenticated account/workspace, canonical destination, and optional caller sub-identity eligible to reuse the same isolation group. Different authenticated scopes or destinations cannot share a circuit or a pooled upstream connection.
 - **Strict isolation** creates a fresh isolation group for each request or tunnel and disables connection reuse where necessary. This is considerably slower and places more load on the Tor network, so it should be reserved for small numbers of genuinely sensitive connections.
 
-If a caller does not provide an isolation identity, the current implementation generates a new ephemeral identity. It does **not** automatically derive an identity from the destination domain. Any future claim of automatic “per-domain isolation” should therefore be backed by a gateway policy or client integration that derives an isolation identity from the account, workspace, and canonical destination.
+Authenticated production ingress derives isolation from the account, workspace,
+and canonical destination automatically. `X-Proxy-Isolation` is an optional
+subdivision inside that tenant boundary, never the boundary itself. The
+loopback plaintext development mode retains the older behavior of generating a
+fresh ephemeral identity when the header is absent.
 
 Circuit isolation means that unrelated streams do not share the same circuit. It does not guarantee a unique exit IP, prevent the Tor network from independently selecting the same exit relay, defeat browser fingerprinting, or stop a sufficiently capable observer from performing timing correlation.
 
 ## Intended deployment
 
-The current deployment model is a single private instance on a Linux VPS. All listeners are loopback-only or local-machine-only by default:
+The current deployment model is a single private instance on a Linux VPS.
+Development listeners are loopback-only or local-machine-only by default.
+Production mode replaces the client ingress with an explicitly configured TLS
+1.3 endpoint that requires both a trusted client certificate and an API key:
 
 | Interface | Purpose | Default exposure |
 |---|---|---|
-| Client ingress | Accepts HTTP proxy traffic and HTTPS `CONNECT` tunnels | Loopback only |
+| Client ingress | Accepts HTTP proxy traffic and HTTPS `CONNECT` tunnels | Plaintext loopback in development; explicit TLS address in production |
 | Internal HTTP service | Runs the Pingora forwarding and cache pipeline | Loopback only |
 | Tor bridge socket | Connects Pingora to the Arti bridge | Unix socket with owner-only permissions |
 | Metrics service | Exposes Prometheus-format operational metrics | Loopback only |
 
-The proxy must not be exposed directly to the public Internet in its current form. A commercial deployment needs an authenticated private transport, such as a customer-specific encrypted tunnel, plus account-level authorization, rate limits, revocation, and an emergency suspension mechanism.
+The default development listener must never be exposed to the public Internet.
+The production code path now supplies mTLS, API-key authorization, revocation,
+and account admission controls, but that code is not by itself proof of a safe
+public deployment. Firewall/process isolation, certificate operations,
+provisioning, controlled-origin validation, monitoring, rollback, and an
+emergency suspension procedure are still deployment gates.
 
 Linux is the current production target because the internal bridge relies on Unix domain sockets and Unix file permissions. Other operating systems should be treated as development targets until their complete runtime paths have been tested.
 
@@ -41,7 +53,7 @@ The system runs as one Rust process with four cooperating layers:
 
 | Layer | Responsibility |
 |---|---|
-| Public ingress | Reads the first proxy request, validates its structure, and dispatches HTTP and `CONNECT` traffic |
+| Public ingress | In production, bounds the TLS handshake and first request, verifies mTLS plus API authorization, and dispatches HTTP and `CONNECT` traffic |
 | Pingora HTTP engine | Handles ordinary HTTP forwarding, conservative shared caching, connection pooling, and response instrumentation |
 | Tor bridge | Applies destination policy, isolation, admission control, retries, circuit breaking, tunnel accounting, and idle timeouts |
 | Arti client | Bootstraps into the Tor network, builds circuits, resolves remote destinations through Tor, and creates outbound streams |
@@ -97,6 +109,70 @@ The ingress listener reads a bounded HTTP header without discarding bytes that m
 
 For HTTPS, the proxy returns a successful tunnel response only after the Tor stream has been established. TLS then remains end-to-end between the client and destination. The proxy does not decrypt or cache tunneled HTTPS traffic.
 
+### Authenticated production ingress
+
+`PROXY_INGRESS_MODE` selects the runtime boundary:
+
+- Unset or `development` keeps the legacy plaintext listener restricted to a
+  loopback address. Supplying production credential settings in this mode is
+  rejected.
+- `production` fails startup unless the TLS certificate, owner-only private
+  key, client CA, account database, and owner-only 32-byte API-key hash secret
+  are all explicit and valid. Only TLS 1.3 with ALPN `http/1.1` is accepted.
+
+Required production settings:
+
+| Variable | Meaning |
+|---|---|
+| `PROXY_INGRESS_LISTEN_ADDR` | Explicit TLS listen address, for example `0.0.0.0:8443` |
+| `PROXY_INGRESS_SERVER_NAMES` | Explicit comma-separated service names recorded in the startup contract; clients still verify the presented certificate |
+| `PROXY_INGRESS_SERVER_CERT` | PEM server certificate chain |
+| `PROXY_INGRESS_SERVER_KEY` | PEM server private key; on Unix it must not be accessible by group or other users |
+| `PROXY_INGRESS_CLIENT_CA` | PEM CA roots trusted to issue client certificates |
+| `PROXY_ACCOUNT_DATABASE` | Owner-only SQLite account/credential/usage database |
+| `PROXY_API_KEY_HASH_KEY_FILE` | Owner-only regular file containing exactly 32 random bytes |
+
+Optional positive integer settings:
+
+| Variable | Default | Meaning |
+|---|---:|---|
+| `PROXY_TLS_HANDSHAKE_TIMEOUT_SECONDS` | `10` | TLS handshake deadline |
+| `PROXY_FIRST_REQUEST_TIMEOUT_SECONDS` | `10` | Post-handshake first-header deadline |
+| `PROXY_MAX_CONCURRENT_TLS_HANDSHAKES` | `64` | Independent TLS work cap |
+| `PROXY_MAX_CLIENT_CONNECTIONS` | `512` | Authenticated client connection cap |
+| `PROXY_MAX_CACHED_ACCOUNTS` | `1024` | Bounded in-memory account admission states |
+| `PROXY_USAGE_PERIOD_SECONDS` | `2592000` | Epoch-aligned usage/quota period |
+| `PROXY_CERT_TRUST_OVERLAP_SECONDS` | `86400` | Planned client-CA rotation overlap |
+
+Generate the API-key hash secret without placing it in an environment variable:
+
+```bash
+umask 077
+openssl rand 32 > /run/proxy/api-key-hash-key
+```
+
+The account database must already contain an active account/workspace, a hashed
+API key, and the SHA-256 fingerprint of the approved client leaf certificate.
+The account module exposes provisioning and revocation operations, but a
+customer dashboard or production admin CLI has not yet been added.
+
+An authorized client can verify an already provisioned endpoint with an HTTPS
+proxy-capable curl:
+
+```bash
+curl --proxy https://proxy.example:8443 \
+  --proxy-cacert server-ca.pem \
+  --proxy-cert client.pem \
+  --proxy-key client-key.pem \
+  --proxy-basic \
+  --proxy-user "$PROXY_API_KEY:" \
+  https://check.torproject.org/api/ip
+```
+
+That command exposes the expanded API key to the local process list on some
+systems; use an owner-only curl config or an application secret store for
+routine operation.
+
 ### Destination safety policy
 
 Before opening a Tor stream, the bridge parses and canonicalizes the requested authority. It rejects missing or zero ports, local hostnames, common private-network suffixes, loopback addresses, private IPv4 ranges, IPv6 unique-local addresses, link-local addresses, multicast addresses, and other non-routable literal addresses.
@@ -108,7 +184,7 @@ This is a baseline server-side request-forgery defense, not a complete commercia
 Isolation state is intentionally ephemeral:
 
 - Isolation identities are length-limited and restricted to a small safe character set.
-- Session identities map to in-memory Arti isolation tokens and connection-pool group keys.
+- Authenticated session identities incorporate account, workspace, canonical destination, and any optional caller sub-identity before mapping to in-memory Arti isolation tokens and connection-pool group keys.
 - Entries expire after inactivity and the store has a fixed maximum size.
 - Strict mode generates a fresh identity and isolation group for every operation.
 - Isolation headers are removed before a request is sent to the destination.
@@ -116,16 +192,22 @@ Isolation state is intentionally ephemeral:
 
 For ordinary HTTP, the Pingora peer is partitioned by the isolation group. This prevents a connection opened for one identity from being reused by another identity. In strict mode, downstream and upstream keep-alive are disabled where needed so that a newly generated token cannot be undermined by an already-open HTTP connection.
 
-In a multi-customer service, an isolation key must be scoped by the authenticated account. A caller-controlled identity alone is not a tenant boundary.
+Opaque, short-lived in-process leases carry authenticated identity across the
+loopback Pingora and owner-only Unix-socket hops. Raw API keys and account
+identifiers are not forwarded in those internal headers, and all
+credential/isolation headers are stripped before an origin request is emitted.
 
 ### Capacity and failure control
 
-The bridge uses three separate limits because they protect different resources:
+The runtime keeps separate limits because they protect different resources:
 
 | Control | Current role | Current starting value |
 |---|---|---:|
-| Connection-task limit | Prevents unbounded accepted tasks and memory growth | 512 |
+| TLS handshake limit | Bounds unauthenticated TLS CPU/work | 64 in production, configurable |
+| Public client connection limit | Bounds accepted client tasks | 512 in production, configurable |
+| Internal connection-task limit | Prevents the public cap from starving Pingora-to-bridge work | 512 |
 | Active-tunnel limit | Caps established long-lived tunnels | 256 |
+| Per-account tunnel/rate limits | Enforces the active account plan | Stored per account |
 | Circuit-build limit | Caps expensive concurrent Tor connect/build operations | 32 |
 
 An active tunnel may wait briefly for capacity. A circuit build may wait longer because circuit construction is expensive and bursty. If the relevant wait expires, the client receives `503 Service Unavailable` with a retry hint.
@@ -143,7 +225,10 @@ The proxy intentionally distinguishes local policy failures from Tor and destina
 | Status | Meaning |
 |---:|---|
 | 400 | Malformed request, invalid authority, or invalid isolation metadata |
-| 403 | Destination rejected by local safety policy |
+| 403 | Inactive/mismatched account or device, or destination rejected by local safety policy |
+| 407 | Missing, invalid, or revoked proxy API key |
+| 408 | Authenticated TLS client did not finish its first request in time |
+| 429 | Per-account request, tunnel, or usage quota reached |
 | 503 | Local capacity exhausted or destination circuit breaker open |
 | 504 | Tor connection establishment exceeded its deadline |
 | 502 | Other Tor, exit-policy, DNS, or destination connection failure |
@@ -190,21 +275,26 @@ Any legally required account, billing, security, or abuse records must be kept s
 
 The design depends on the following boundaries:
 
-- The client ingress is trusted only after commercial authentication is added.
+- Production client ingress is trusted only after both mTLS and API-key authentication succeed; development ingress remains loopback-only and unauthenticated.
 - The loopback Pingora listener is not a public interface.
 - The Unix bridge socket is restricted to the operating-system owner.
 - The metrics listener is loopback-only and must remain inaccessible from untrusted networks.
 - The Arti client is the only supported route to the destination; there is no direct-connect fallback.
 - Ephemeral isolation state is not a substitute for account authentication or tenant separation.
 
-A production deployment should additionally provide encrypted private access, hashed and revocable credentials, per-account rate and usage limits, least-privilege service accounts, a read-only or tightly restricted filesystem, automatic security updates, secret rotation, monitored restarts, encrypted backups for account data, and an emergency abuse-response procedure.
+A production deployment should additionally provide least-privilege service
+accounts, a read-only or tightly restricted filesystem, automatic security
+updates, certificate and hash-secret rotation, monitored restarts, encrypted
+backups for account data, and an emergency abuse-response procedure.
 
 ## Known limitations
 
-- There is no customer authentication, billing, dashboard, or persistent usage ledger yet.
-- The listener configuration is suitable for local development, not direct Internet exposure.
+- Authentication, revocation, rate limits, concurrent-tunnel limits, and aggregate SQLite usage accounting are active only in production ingress mode. There is no billing integration, dashboard, or production admin CLI yet.
+- Usage bytes are committed when a Tor transport closes; a process crash during an active tunnel can lose that tunnel's uncommitted usage, and an active tunnel can exceed a period byte cap before its final total is recorded.
+- Certificate reload/rotation, live production monitoring, and target-host rollback drills remain unimplemented or unverified.
+- The default listener configuration is suitable for local development, not direct Internet exposure.
 - Isolation does not guarantee different exit IP addresses or immunity from traffic correlation.
-- Default behavior is fresh ephemeral isolation, not automatic destination-derived isolation.
+- Development mode defaults to fresh ephemeral isolation; authenticated production mode derives it from tenant and destination.
 - Tor is slower and less predictable than commercial datacenter or residential proxy networks.
 - Strict isolation has a meaningful performance and Tor-network cost.
 - Some destinations block Tor exits regardless of circuit rotation.
@@ -213,7 +303,10 @@ A production deployment should additionally provide encrypted private access, ha
 
 ## Development and verification
 
-The repository currently keeps the implementation in a single Rust source unit. The primary dependencies are Pingora for HTTP proxying and caching, Tokio for asynchronous I/O, and Arti for Tor client functionality.
+The runtime remains centered in `src/main.rs`, with private-ingress and account
+management policy isolated in their own modules. The primary dependencies are
+Pingora for HTTP proxying and caching, Tokio/Rustls for asynchronous encrypted
+ingress, and Arti for Tor client functionality.
 
 The required local verification order is:
 
@@ -223,7 +316,11 @@ The required local verification order is:
 4. Start the proxy and allow Arti to bootstrap.
 5. Run the controlled HTTP and HTTPS functional matrix against infrastructure that is authorized for testing.
 
-At the time this document was written, the compiler check passed and 30 automated tests passed. Two tests remain intentionally ignored because they require a running proxy and controlled external test origins. Published reliability or performance claims must come from those controlled tests, not from public websites or a local in-memory transport benchmark.
+At the time this document was updated, the locked compiler check passed and 75
+automated tests passed. Two tests remain intentionally ignored because they
+require a running proxy and controlled external test origins. Published
+reliability or performance claims must come from those controlled tests, not
+from public websites or a local in-memory transport benchmark.
 
 ### End-to-end deployment test
 

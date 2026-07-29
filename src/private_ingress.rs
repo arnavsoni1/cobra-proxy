@@ -1,7 +1,8 @@
-//! Phase 1 configuration and TLS construction for the private ingress.
+//! Typed configuration and TLS construction for the private ingress.
 //!
-//! This module intentionally does not bind or accept a socket. Phase 2 will
-//! connect the validated `rustls::ServerConfig` to the public accept loop.
+//! Socket ownership and request dispatch stay in `main.rs`; production runtime
+//! configuration from this module is connected there to a bounded
+//! `tokio_rustls::TlsAcceptor` loop.
 
 use rustls::{
     RootCertStore, ServerConfig,
@@ -76,7 +77,7 @@ pub(crate) struct IngressTimeouts {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IngressCapacity {
-    /// A dedicated Phase 2 semaphore will use this limit before TLS work.
+    /// The public accept loop acquires this dedicated limit before TLS work.
     pub max_concurrent_handshakes: usize,
     pub max_client_connections: usize,
 }
@@ -100,6 +101,252 @@ pub(crate) struct IngressConfig {
     pub timeouts: IngressTimeouts,
     pub capacity: IngressCapacity,
     pub certificate_rotation: CertificateRotationPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeIngressConfig {
+    Development {
+        listen_addr: SocketAddr,
+    },
+    Production {
+        tls: Box<IngressConfig>,
+        account_database: PathBuf,
+        api_key_hash_key_file: PathBuf,
+        max_cached_accounts: usize,
+        usage_period: Duration,
+    },
+}
+
+impl RuntimeIngressConfig {
+    pub(crate) fn from_environment() -> Result<Self, PrivateIngressError> {
+        Self::from_lookup(&|name| {
+            let Some(value) = std::env::var_os(name) else {
+                return Ok(None);
+            };
+            value
+                .into_string()
+                .map(Some)
+                .map_err(|_| PrivateIngressError::RuntimeConfiguration {
+                    variable: name,
+                    detail: "value is not valid UTF-8".to_owned(),
+                })
+        })
+    }
+
+    fn from_lookup<F>(lookup: &F) -> Result<Self, PrivateIngressError>
+    where
+        F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+    {
+        const MODE: &str = "PROXY_INGRESS_MODE";
+        const LISTEN_ADDR: &str = "PROXY_INGRESS_LISTEN_ADDR";
+        const SERVER_NAMES: &str = "PROXY_INGRESS_SERVER_NAMES";
+        const SERVER_CERT: &str = "PROXY_INGRESS_SERVER_CERT";
+        const SERVER_KEY: &str = "PROXY_INGRESS_SERVER_KEY";
+        const CLIENT_CA: &str = "PROXY_INGRESS_CLIENT_CA";
+        const ACCOUNT_DATABASE: &str = "PROXY_ACCOUNT_DATABASE";
+        const API_KEY_HASH_KEY_FILE: &str = "PROXY_API_KEY_HASH_KEY_FILE";
+        const TLS_HANDSHAKE_SECONDS: &str = "PROXY_TLS_HANDSHAKE_TIMEOUT_SECONDS";
+        const FIRST_REQUEST_SECONDS: &str = "PROXY_FIRST_REQUEST_TIMEOUT_SECONDS";
+        const MAX_HANDSHAKES: &str = "PROXY_MAX_CONCURRENT_TLS_HANDSHAKES";
+        const MAX_CONNECTIONS: &str = "PROXY_MAX_CLIENT_CONNECTIONS";
+        const TRUST_OVERLAP_SECONDS: &str = "PROXY_CERT_TRUST_OVERLAP_SECONDS";
+        const MAX_CACHED_ACCOUNTS: &str = "PROXY_MAX_CACHED_ACCOUNTS";
+        const USAGE_PERIOD_SECONDS: &str = "PROXY_USAGE_PERIOD_SECONDS";
+
+        let mode = optional_value(lookup, MODE)?
+            .unwrap_or_else(|| "development".to_owned())
+            .trim()
+            .to_ascii_lowercase();
+        if mode == "development" {
+            let production_only = [
+                SERVER_NAMES,
+                SERVER_CERT,
+                SERVER_KEY,
+                CLIENT_CA,
+                ACCOUNT_DATABASE,
+                API_KEY_HASH_KEY_FILE,
+                TLS_HANDSHAKE_SECONDS,
+                FIRST_REQUEST_SECONDS,
+                MAX_HANDSHAKES,
+                MAX_CONNECTIONS,
+                TRUST_OVERLAP_SECONDS,
+                MAX_CACHED_ACCOUNTS,
+                USAGE_PERIOD_SECONDS,
+            ];
+            for variable in production_only {
+                if optional_value(lookup, variable)?.is_some() {
+                    return Err(PrivateIngressError::RuntimeConfiguration {
+                        variable: MODE,
+                        detail:
+                            "production credential settings require PROXY_INGRESS_MODE=production"
+                                .to_owned(),
+                    });
+                }
+            }
+            let listen_addr = optional_value(lookup, LISTEN_ADDR)?
+                .unwrap_or_else(|| "127.0.0.1:8080".to_owned())
+                .parse::<SocketAddr>()
+                .map_err(|error| PrivateIngressError::RuntimeConfiguration {
+                    variable: LISTEN_ADDR,
+                    detail: error.to_string(),
+                })?;
+            if !listen_addr.ip().is_loopback() {
+                return Err(PrivateIngressError::RuntimeConfiguration {
+                    variable: LISTEN_ADDR,
+                    detail: "development plaintext ingress must remain loopback-only".to_owned(),
+                });
+            }
+            return Ok(Self::Development { listen_addr });
+        }
+        if mode != "production" {
+            return Err(PrivateIngressError::RuntimeConfiguration {
+                variable: MODE,
+                detail: "expected development or production".to_owned(),
+            });
+        }
+
+        let listen_addr = required_value(lookup, LISTEN_ADDR)?
+            .parse::<SocketAddr>()
+            .map_err(|error| PrivateIngressError::RuntimeConfiguration {
+                variable: LISTEN_ADDR,
+                detail: error.to_string(),
+            })?;
+        let server_names = required_value(lookup, SERVER_NAMES)?
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let tls = IngressConfig {
+            listen_addr,
+            server_names,
+            deployment_mode: DeploymentMode::Production,
+            tls_material: TlsMaterialPaths {
+                server_certificate_chain: PathBuf::from(required_value(lookup, SERVER_CERT)?),
+                server_private_key: PathBuf::from(required_value(lookup, SERVER_KEY)?),
+                client_ca_roots: Some(PathBuf::from(required_value(lookup, CLIENT_CA)?)),
+            },
+            client_certificates: ClientCertificateMode::Required,
+            api_keys: ApiKeyMode::Required,
+            alpn: AlpnPolicy::Http11Only,
+            timeouts: IngressTimeouts {
+                tls_handshake: duration_value(lookup, TLS_HANDSHAKE_SECONDS, 10)?,
+                first_request: duration_value(lookup, FIRST_REQUEST_SECONDS, 10)?,
+            },
+            capacity: IngressCapacity {
+                max_concurrent_handshakes: usize_value(lookup, MAX_HANDSHAKES, 64)?,
+                max_client_connections: usize_value(lookup, MAX_CONNECTIONS, 512)?,
+            },
+            certificate_rotation: CertificateRotationPolicy {
+                reload_strategy: CertificateReloadStrategy::ValidateThenAtomicSwap,
+                trust_overlap: duration_value(lookup, TRUST_OVERLAP_SECONDS, 86_400)?,
+            },
+        };
+        tls.validate()?;
+
+        Ok(Self::Production {
+            tls: Box::new(tls),
+            account_database: PathBuf::from(required_value(lookup, ACCOUNT_DATABASE)?),
+            api_key_hash_key_file: PathBuf::from(required_value(lookup, API_KEY_HASH_KEY_FILE)?),
+            max_cached_accounts: usize_value(lookup, MAX_CACHED_ACCOUNTS, 1_024)?,
+            usage_period: duration_value(lookup, USAGE_PERIOD_SECONDS, 2_592_000)?,
+        })
+    }
+
+    pub(crate) fn listen_addr(&self) -> SocketAddr {
+        match self {
+            Self::Development { listen_addr } => *listen_addr,
+            Self::Production { tls, .. } => tls.listen_addr,
+        }
+    }
+}
+
+fn optional_value<F>(
+    lookup: &F,
+    variable: &'static str,
+) -> Result<Option<String>, PrivateIngressError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+{
+    lookup(variable).map(|value| value.filter(|value| !value.trim().is_empty()))
+}
+
+fn required_value<F>(lookup: &F, variable: &'static str) -> Result<String, PrivateIngressError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+{
+    optional_value(lookup, variable)?.ok_or_else(|| PrivateIngressError::RuntimeConfiguration {
+        variable,
+        detail: "value is required in production mode".to_owned(),
+    })
+}
+
+fn duration_value<F>(
+    lookup: &F,
+    variable: &'static str,
+    default_seconds: u64,
+) -> Result<Duration, PrivateIngressError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+{
+    let seconds = u64_value(lookup, variable, default_seconds)?;
+    Ok(Duration::from_secs(seconds))
+}
+
+fn usize_value<F>(
+    lookup: &F,
+    variable: &'static str,
+    default: usize,
+) -> Result<usize, PrivateIngressError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+{
+    let value = optional_value(lookup, variable)?
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| PrivateIngressError::RuntimeConfiguration {
+                    variable,
+                    detail: error.to_string(),
+                })
+        })
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        return Err(PrivateIngressError::RuntimeConfiguration {
+            variable,
+            detail: "value must be positive".to_owned(),
+        });
+    }
+    Ok(value)
+}
+
+fn u64_value<F>(
+    lookup: &F,
+    variable: &'static str,
+    default: u64,
+) -> Result<u64, PrivateIngressError>
+where
+    F: Fn(&'static str) -> Result<Option<String>, PrivateIngressError>,
+{
+    let value = optional_value(lookup, variable)?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|error| PrivateIngressError::RuntimeConfiguration {
+                    variable,
+                    detail: error.to_string(),
+                })
+        })
+        .transpose()?
+        .unwrap_or(default);
+    if value == 0 {
+        return Err(PrivateIngressError::RuntimeConfiguration {
+            variable,
+            detail: "value must be positive".to_owned(),
+        });
+    }
+    Ok(value)
 }
 
 impl IngressConfig {
@@ -205,6 +452,10 @@ impl fmt::Display for PemMaterial {
 #[derive(Debug)]
 pub(crate) enum PrivateIngressError {
     InvalidConfiguration(&'static str),
+    RuntimeConfiguration {
+        variable: &'static str,
+        detail: String,
+    },
     ReadMaterial {
         material: PemMaterial,
         path: PathBuf,
@@ -215,6 +466,8 @@ pub(crate) enum PrivateIngressError {
         path: PathBuf,
         source: io::Error,
     },
+    InsecurePrivateKeyPath(&'static str),
+    InsecurePrivateKeyPermissions(u32),
     EmptyCertificateChain,
     MissingPrivateKey,
     AmbiguousPrivateKeys {
@@ -238,6 +491,12 @@ impl fmt::Display for PrivateIngressError {
             Self::InvalidConfiguration(detail) => {
                 write!(formatter, "invalid private ingress configuration: {detail}")
             }
+            Self::RuntimeConfiguration { variable, detail } => {
+                write!(
+                    formatter,
+                    "invalid private ingress setting {variable}: {detail}"
+                )
+            }
             Self::ReadMaterial {
                 material,
                 path,
@@ -255,6 +514,14 @@ impl fmt::Display for PrivateIngressError {
                 formatter,
                 "malformed {material} PEM in {}: {source}",
                 path.display()
+            ),
+            Self::InsecurePrivateKeyPath(detail) => {
+                write!(formatter, "unsafe TLS private key path: {detail}")
+            }
+            Self::InsecurePrivateKeyPermissions(mode) => write!(
+                formatter,
+                "TLS private key permissions are too broad: mode {:o}",
+                mode & 0o777
             ),
             Self::EmptyCertificateChain => formatter.write_str("server certificate chain is empty"),
             Self::MissingPrivateKey => formatter.write_str("server private key is missing"),
@@ -377,6 +644,30 @@ fn load_certificates(
 
 fn load_one_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, PrivateIngressError> {
     let material = PemMaterial::ServerPrivateKey;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|source| PrivateIngressError::ReadMaterial {
+            material,
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if metadata.file_type().is_symlink() {
+        return Err(PrivateIngressError::InsecurePrivateKeyPath(
+            "symbolic links are not accepted",
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(PrivateIngressError::InsecurePrivateKeyPath(
+            "path is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(PrivateIngressError::InsecurePrivateKeyPermissions(mode));
+        }
+    }
     let mut reader = open_material(path, material)?;
     let mut keys = Vec::new();
     for item in rustls_pemfile::read_all(&mut reader) {
@@ -428,11 +719,16 @@ mod tests {
     use super::{
         AlpnPolicy, ApiKeyMode, CertificateReloadStrategy, CertificateRotationPolicy,
         ClientCertificateMode, DeploymentMode, HTTP_1_1_ALPN, IngressCapacity, IngressConfig,
-        IngressTimeouts, PemMaterial, PrivateIngressError, TlsMaterialPaths, load_certificates,
-        load_one_private_key, load_server_config, validate_negotiated_alpn,
+        IngressTimeouts, PemMaterial, PrivateIngressError, RuntimeIngressConfig, TlsMaterialPaths,
+        load_certificates, load_one_private_key, load_server_config, validate_negotiated_alpn,
     };
+    use crate::account_management::{
+        AccountLimits, AccountManager, ApiKeyHasher, PlanCode, UnixTimestamp,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rustls::{ClientConfig, ProtocolVersion, RootCertStore, pki_types::ServerName};
     use std::{
+        collections::HashMap,
         error::Error as StdError,
         fs, io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -443,8 +739,12 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::io::DuplexStream;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use zeroize::Zeroizing;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     const TRUSTED_CA_CERTIFICATE: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBpTCCAU2gAwIBAgIUZ2VAo+EmM/0Hfw+NAaMmj70KOSIwCgYIKoZIzj0EAwIw
@@ -538,6 +838,10 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
         fn write(&self, name: &str, contents: &str) -> io::Result<PathBuf> {
             let path = self.path.join(name);
             fs::write(&path, contents)?;
+            #[cfg(unix)]
+            if name.contains("key") {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            }
             Ok(path)
         }
     }
@@ -626,6 +930,7 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
     struct HandshakeObservation {
         protocol_version: Option<ProtocolVersion>,
         alpn_protocol: Option<Vec<u8>>,
+        client_fingerprint_available: bool,
     }
 
     fn client_config(
@@ -684,12 +989,14 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
             .map(|stream| HandshakeObservation {
                 protocol_version: stream.get_ref().1.protocol_version(),
                 alpn_protocol: stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec),
+                client_fingerprint_available: crate::tls_client_fingerprint(&stream).is_ok(),
             })
             .map_err(|error| error.to_string());
         let client = client
             .map(|stream| HandshakeObservation {
                 protocol_version: stream.get_ref().1.protocol_version(),
                 alpn_protocol: stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec),
+                client_fingerprint_available: false,
             })
             .map_err(|error| error.to_string());
         (server, client)
@@ -700,6 +1007,88 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
             Ok(_) => Err(io::Error::other("expected private ingress operation to fail").into()),
             Err(error) => Ok(error),
         }
+    }
+
+    fn runtime_config_from(
+        values: &[(&'static str, &'static str)],
+    ) -> Result<RuntimeIngressConfig, PrivateIngressError> {
+        let values = values
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_owned()))
+            .collect::<HashMap<_, _>>();
+        RuntimeIngressConfig::from_lookup(&|name| Ok(values.get(name).cloned()))
+    }
+
+    #[test]
+    fn runtime_config_defaults_to_loopback_development() -> TestResult {
+        let config = runtime_config_from(&[])?;
+        assert_eq!(
+            config,
+            RuntimeIngressConfig::Development {
+                listen_addr: "127.0.0.1:8080".parse()?,
+            }
+        );
+
+        let error = runtime_config_from(&[("PROXY_INGRESS_LISTEN_ADDR", "0.0.0.0:8080")])
+            .expect_err("plaintext non-loopback ingress must be rejected");
+        assert!(matches!(
+            error,
+            PrivateIngressError::RuntimeConfiguration {
+                variable: "PROXY_INGRESS_LISTEN_ADDR",
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn production_runtime_config_requires_and_bounds_auth_settings() -> TestResult {
+        let values = [
+            ("PROXY_INGRESS_MODE", "production"),
+            ("PROXY_INGRESS_LISTEN_ADDR", "0.0.0.0:8443"),
+            (
+                "PROXY_INGRESS_SERVER_NAMES",
+                "proxy.example, proxy-alt.example",
+            ),
+            ("PROXY_INGRESS_SERVER_CERT", "/run/proxy/server.pem"),
+            ("PROXY_INGRESS_SERVER_KEY", "/run/proxy/server-key.pem"),
+            ("PROXY_INGRESS_CLIENT_CA", "/run/proxy/client-ca.pem"),
+            ("PROXY_ACCOUNT_DATABASE", "/var/lib/proxy/accounts.sqlite3"),
+            ("PROXY_API_KEY_HASH_KEY_FILE", "/run/proxy/api-key-hash-key"),
+            ("PROXY_MAX_CONCURRENT_TLS_HANDSHAKES", "17"),
+            ("PROXY_MAX_CLIENT_CONNECTIONS", "23"),
+            ("PROXY_USAGE_PERIOD_SECONDS", "3600"),
+        ];
+        let config = runtime_config_from(&values)?;
+        let RuntimeIngressConfig::Production {
+            tls,
+            account_database,
+            api_key_hash_key_file,
+            max_cached_accounts,
+            usage_period,
+        } = config
+        else {
+            return Err(io::Error::other("expected production runtime config").into());
+        };
+        assert_eq!(tls.listen_addr, "0.0.0.0:8443".parse()?);
+        assert_eq!(tls.server_names.len(), 2);
+        assert_eq!(tls.capacity.max_concurrent_handshakes, 17);
+        assert_eq!(tls.capacity.max_client_connections, 23);
+        assert_eq!(
+            account_database,
+            PathBuf::from("/var/lib/proxy/accounts.sqlite3")
+        );
+        assert_eq!(
+            api_key_hash_key_file,
+            PathBuf::from("/run/proxy/api-key-hash-key")
+        );
+        assert_eq!(max_cached_accounts, 1_024);
+        assert_eq!(usage_period, Duration::from_secs(3_600));
+
+        let mut invalid = values.to_vec();
+        invalid.push(("PROXY_FIRST_REQUEST_TIMEOUT_SECONDS", "0"));
+        assert!(runtime_config_from(&invalid).is_err());
+        Ok(())
     }
 
     #[test]
@@ -770,6 +1159,36 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn loader_rejects_broad_or_linked_private_keys() -> TestResult {
+        let fixtures = FixturePaths::create()?;
+        fs::set_permissions(
+            &fixtures.server_private_key,
+            fs::Permissions::from_mode(0o644),
+        )?;
+        let error = require_error(load_server_config(&fixtures.production_config()))?;
+        assert!(matches!(
+            error,
+            PrivateIngressError::InsecurePrivateKeyPermissions(_)
+        ));
+
+        fs::set_permissions(
+            &fixtures.server_private_key,
+            fs::Permissions::from_mode(0o600),
+        )?;
+        let linked_key = fixtures._directory.path.join("linked-server-key.pem");
+        std::os::unix::fs::symlink(&fixtures.server_private_key, &linked_key)?;
+        let mut config = fixtures.production_config();
+        config.tls_material.server_private_key = linked_key;
+        let error = require_error(load_server_config(&config))?;
+        assert!(matches!(
+            error,
+            PrivateIngressError::InsecurePrivateKeyPath(_)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn loader_rejects_empty_client_root_store() -> TestResult {
         let fixtures = FixturePaths::create()?;
@@ -818,7 +1237,118 @@ n9le6sB4t6HVfTOF+gLSEkKcL1HXESHlyCX2w2d96YAkOou8ObfZ7iYj
         assert_eq!(client.protocol_version, Some(ProtocolVersion::TLSv1_3));
         assert_eq!(server.alpn_protocol.as_deref(), Some(HTTP_1_1_ALPN));
         assert_eq!(client.alpn_protocol.as_deref(), Some(HTTP_1_1_ALPN));
+        assert!(server.client_fingerprint_available);
         validate_negotiated_alpn(server.alpn_protocol.as_deref())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_tls_accept_rejects_capacity_and_slow_handshakes() -> TestResult {
+        let fixtures = FixturePaths::create()?;
+        let server_config = load_server_config(&fixtures.production_config())?;
+        let (capacity_server, _capacity_client) = tokio::io::duplex(1_024);
+        let capacity_error = crate::accept_bounded_tls(
+            capacity_server,
+            TlsAcceptor::from(server_config.clone()),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("exhausted handshake capacity must reject");
+        assert!(capacity_error.to_string().contains("capacity"));
+
+        let (slow_server, _slow_client) = tokio::io::duplex(1_024);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let timeout_error = crate::accept_bounded_tls(
+            slow_server,
+            TlsAcceptor::from(server_config.clone()),
+            semaphore.clone(),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("silent TLS client must time out");
+        assert!(timeout_error.to_string().contains("timed out"));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        let (plaintext_server, mut plaintext_client) = tokio::io::duplex(1_024);
+        let accepting = crate::accept_bounded_tls(
+            plaintext_server,
+            TlsAcceptor::from(server_config),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Duration::from_secs(1),
+        );
+        let sending_plaintext = async {
+            plaintext_client
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+                .await?;
+            plaintext_client.shutdown().await
+        };
+        let (accept_result, plaintext_result) = tokio::join!(accepting, sending_plaintext);
+        plaintext_result?;
+        assert!(accept_result.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_tls_fingerprint_and_api_key_bind_the_same_account() -> TestResult {
+        let fixtures = FixturePaths::create()?;
+        let server_config = load_server_config(&fixtures.production_config())?;
+        let client_config = client_config(
+            &fixtures,
+            Some((
+                &fixtures.authorized_client_certificate,
+                &fixtures.authorized_client_private_key,
+            )),
+            vec![HTTP_1_1_ALPN.to_vec()],
+        )?;
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server_name = ServerName::try_from("localhost")?;
+        let (server, client) = tokio::join!(
+            TlsAcceptor::from(server_config).accept(server_io),
+            TlsConnector::from(client_config).connect(server_name, client_io),
+        );
+        let mut server = server?;
+        let mut client = client?;
+        let fingerprint = crate::tls_client_fingerprint(&server)?;
+
+        let manager = AccountManager::open_in_memory(
+            ApiKeyHasher::from_key(Zeroizing::new([0x63; blake3::KEY_LEN])),
+            8,
+        )?;
+        let now = UnixTimestamp::new(100)?;
+        let account = manager.create_account(
+            "tls-account@example.com",
+            None,
+            &PlanCode::new("test")?,
+            AccountLimits::new(10, 10, 2, None, None)?,
+            now,
+        )?;
+        let workspace = manager.create_workspace(account.id(), "default", now)?;
+        let api_key = manager.issue_api_key(account.id(), workspace.id(), "test", now)?;
+        manager.register_device_credential(
+            account.id(),
+            workspace.id(),
+            &fingerprint,
+            "trusted fixture",
+            now,
+        )?;
+        let authorization = STANDARD.encode(format!("{}:", api_key.secret().expose_secret()));
+        client
+            .write_all(
+                format!(
+                    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic {authorization}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let (mut request, _) = crate::read_proxy_request(&mut server).await?;
+        let proxy_authorization = request
+            .proxy_authorization
+            .take()
+            .ok_or_else(|| io::Error::other("missing parsed proxy authorization"))?;
+        let identity = manager.authenticate_ingress(proxy_authorization.as_str(), &fingerprint)?;
+        assert_eq!(identity.account_id(), account.id());
+        assert_eq!(identity.workspace_id(), workspace.id());
         Ok(())
     }
 

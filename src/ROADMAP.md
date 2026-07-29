@@ -155,7 +155,7 @@ all required listeners and the Unix socket.
 
 ## Phase 2 — Implement authenticated private ingress
 
-**Status:** planned  
+**Status:** implemented in the runtime; controlled deployment verification pending
 **Source of truth:** [Rustls private ingress plan](../docs/plans/ingress/rustls-private-ingress.md)
 
 - Add Rustls/Tokio-Rustls around the public ingress while keeping the current
@@ -167,18 +167,30 @@ all required listeners and the Unix socket.
 - Scope session isolation and upstream pooling by authenticated account and
   workspace; strip internal/credential headers before origin forwarding.
 
+The production runtime now loads explicit TLS/account configuration, bounds
+handshakes and first headers separately, requires a trusted client
+certificate plus matching API-key scope, and carries an opaque authenticated
+lease through `RequestCtx` and the internal hops. The default development
+listener remains plaintext but is restricted to loopback.
+
 **Gate:** TLS-protected ordinary HTTP and HTTPS CONNECT pass the controlled
 matrix; plaintext access and unauthenticated access cannot reach Tor.
 
 ## Phase 3 — Apply account abuse controls and operational observability
 
-**Status:** planned
+**Status:** partially implemented
 
 - Add per-account rate and concurrent-tunnel limits, revocation, and bounded
   usage accounting.
 - Preserve low-cardinality, privacy-safe metrics and structured logs.
 - Add certificate reload/rotation, health checks, and an alerting strategy.
 - Keep the metrics and administrative interfaces private.
+
+Per-account request rate, concurrent-tunnel admission, credential revocation,
+atomic request-quota admission, and aggregate request/byte usage writes are now
+connected to production ingress. Certificate reload/rotation, operational
+health checks, alerting, crash-period usage checkpointing, and the controlled
+deployment matrix remain open.
 
 **Gate:** suspension, quota, slow-handshake, slow-header, and capacity tests
 fail predictably without a direct-egress path or unbounded resources.

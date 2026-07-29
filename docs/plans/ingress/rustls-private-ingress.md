@@ -1,8 +1,14 @@
 # Private Rustls Ingress Plan and Manual-Implementation Inventory
 
-**Status:** design and migration plan; no ingress code has been changed by this
-document.  
-**Reviewed:** 2026-07-21
+**Status:** phases 1–4 implemented in the local runtime; controlled deployment,
+certificate reload/rotation, and phase 5 operational proof remain open.
+**Reviewed:** 2026-07-29
+
+Implementation note: `src/private_ingress.rs` owns typed production
+configuration and TLS construction, `src/account_management.rs` owns
+credential/account policy, and `src/main.rs` connects both to the bounded
+accept loop and `RequestCtx`. The inventory below preserves the original
+migration rationale as well as the remaining deployment gates.
 
 ## Decision summary
 

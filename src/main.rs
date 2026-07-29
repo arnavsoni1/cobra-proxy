@@ -1,6 +1,17 @@
 #[allow(dead_code)]
+mod account_management;
+
+#[allow(dead_code)]
 mod private_ingress;
 
+use account_management::{
+	AccountId, AccountManager, AdmissionError as AccountAdmissionError, ApiKeyHasher,
+	AuthenticationError, CertificateFingerprint, IngressIdentity, UnixTimestamp, UsageDelta,
+	UsageAdmissionError,
+};
+use private_ingress::{
+	RuntimeIngressConfig, load_server_config, validate_negotiated_alpn,
+};
 use pingora::{
 	prelude::*, 
 	cache::{
@@ -20,11 +31,15 @@ use pingora::{
 	upstreams::peer::Proxy as CrateProxy,
 };
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest as _, Sha256};
 use std::{
 	collections::HashMap,
+	fmt,
 	future::Future,
+	hash::{Hash, Hasher},
 	process,
-	net::IpAddr,
+	net::{IpAddr, SocketAddr},
 	sync::{
 		atomic::{AtomicU64, AtomicUsize, Ordering},
 		Arc, Mutex, OnceLock
@@ -52,6 +67,8 @@ use tokio::{
 	time::Duration
 	//sync::{Semaphore, SemaphorePermit}
 };
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use zeroize::{Zeroize, Zeroizing};
 //use anyhow::*;
 
 static CACHE: OnceLock<MemCache> = OnceLock::new();
@@ -66,6 +83,8 @@ const MAX_CONNECT_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONNECT_HEADERS: usize = 64;
 const ISOLATION_HEADER: &str = "X-Proxy-Isolation";
 const ISOLATION_MODE_HEADER: &str = "X-Proxy-Isolation-Mode";
+const PROXY_AUTHORIZATION_HEADER: &str = "Proxy-Authorization";
+const INTERNAL_IDENTITY_HEADER: &str = "X-Proxy-Authenticated-Lease";
 const MAX_ISOLATION_ID_BYTES: usize = 64;
 const MAX_ISOLATION_TOKENS: usize = 10_000;
 const ISOLATION_TOKEN_TTL: Duration = Duration::from_secs(30 * 60);
@@ -97,6 +116,11 @@ const BAD_REQUEST_RESPONSE: &[u8] = b"HTTP/1.1 400 Bad Request\r\nContent-Length
 const FORBIDDEN_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const BAD_GATEWAY_RESPONSE: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const GATEWAY_TIMEOUT_RESPONSE: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const PROXY_AUTH_REQUIRED_RESPONSE: &[u8] = b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"private-proxy\", charset=\"UTF-8\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const RATE_LIMITED_RESPONSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const QUOTA_EXCEEDED_RESPONSE: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const REQUEST_TIMEOUT_RESPONSE: &[u8] = b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const SERVICE_UNAVAILABLE_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 static ISOLATION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ISOLATION_GROUP_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -219,6 +243,335 @@ impl IsolationStore {
 		let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		inner.entries.retain(|_, entry| entry.expires_at > now);
 		inner.entries.len()
+	}
+}
+
+#[derive(Clone)]
+struct TenantIsolationHasher {
+	key: Arc<Zeroizing<[u8; blake3::KEY_LEN]>>,
+}
+
+impl TenantIsolationHasher {
+	fn new() -> anyhow::Result<Self> {
+		let mut key = [0_u8; blake3::KEY_LEN];
+		getrandom::fill(&mut key)
+			.map_err(|error| anyhow::anyhow!("failed to seed tenant isolation: {error}"))?;
+		Ok(Self {
+			key: Arc::new(Zeroizing::new(key)),
+		})
+	}
+
+	fn resolve(
+		&self,
+		identity: IngressIdentity,
+		destination: &str,
+		request: IsolationRequest,
+	) -> ResolvedIsolation {
+		let mut hasher =
+			Blake3HashAdapter(blake3::Hasher::new_keyed(self.key.as_ref()));
+		hasher.0.update(b"proxy-tenant-isolation-v1\0");
+		identity.account_id().hash(&mut hasher);
+		identity.workspace_id().hash(&mut hasher);
+		destination.hash(&mut hasher);
+		request.identity.hash(&mut hasher);
+		let strict_nonce = if request.strict {
+			Some(ISOLATION_ID_COUNTER.fetch_add(1, Ordering::Relaxed))
+		} else {
+			None
+		};
+		strict_nonce.hash(&mut hasher);
+		ResolvedIsolation {
+			identity: hasher.0.finalize().to_hex().to_string(),
+			strict: request.strict,
+		}
+	}
+}
+
+struct Blake3HashAdapter(blake3::Hasher);
+
+impl Hasher for Blake3HashAdapter {
+	fn finish(&self) -> u64 {
+		let mut bytes = [0_u8; 8];
+		bytes.copy_from_slice(&self.0.clone().finalize().as_bytes()[..8]);
+		u64::from_le_bytes(bytes)
+	}
+
+	fn write(&mut self, bytes: &[u8]) {
+		self.0.update(bytes);
+	}
+}
+
+#[derive(Clone)]
+struct AuthenticatedRequestContext {
+	scope: AccountRequestScope,
+	isolation: IsolationRequest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccountRequestScope {
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+}
+
+struct DownstreamContextEntry {
+	generation: u64,
+	context: AuthenticatedRequestContext,
+}
+
+struct AuthenticatedDownstreamStore {
+	entries: Mutex<HashMap<SocketAddr, DownstreamContextEntry>>,
+	capacity: usize,
+	sequence: AtomicU64,
+}
+
+impl AuthenticatedDownstreamStore {
+	fn new(capacity: usize) -> Self {
+		assert!(capacity > 0, "authenticated downstream capacity must be positive");
+		Self {
+			entries: Mutex::new(HashMap::new()),
+			capacity,
+			sequence: AtomicU64::new(1),
+		}
+	}
+
+	fn register(
+		self: &Arc<Self>,
+		address: SocketAddr,
+		context: AuthenticatedRequestContext,
+	) -> anyhow::Result<AuthenticatedDownstreamGuard> {
+		let generation = self.sequence.fetch_add(1, Ordering::Relaxed);
+		let mut entries = self
+			.entries
+			.lock()
+			.map_err(|_| anyhow::anyhow!("authenticated downstream store is unavailable"))?;
+		if entries.len() >= self.capacity && !entries.contains_key(&address) {
+			anyhow::bail!("authenticated downstream store capacity reached");
+		}
+		if entries
+			.insert(address, DownstreamContextEntry { generation, context })
+			.is_some()
+		{
+			anyhow::bail!("duplicate authenticated downstream address");
+		}
+		Ok(AuthenticatedDownstreamGuard {
+			store: Arc::clone(self),
+			address,
+			generation,
+		})
+	}
+
+	fn context(&self, address: &SocketAddr) -> Option<AuthenticatedRequestContext> {
+		self.entries
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.get(address)
+			.map(|entry| entry.context.clone())
+	}
+
+	fn remove(&self, address: SocketAddr, generation: u64) {
+		let mut entries = self
+			.entries
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		if entries
+			.get(&address)
+			.is_some_and(|entry| entry.generation == generation)
+		{
+			entries.remove(&address);
+		}
+	}
+}
+
+struct AuthenticatedDownstreamGuard {
+	store: Arc<AuthenticatedDownstreamStore>,
+	address: SocketAddr,
+	generation: u64,
+}
+
+impl Drop for AuthenticatedDownstreamGuard {
+	fn drop(&mut self) {
+		self.store.remove(self.address, self.generation);
+	}
+}
+
+struct BridgeIdentityRegistry {
+	entries: Mutex<HashMap<String, AccountRequestScope>>,
+	capacity: usize,
+}
+
+impl BridgeIdentityRegistry {
+	fn new(capacity: usize) -> Self {
+		assert!(capacity > 0, "bridge identity capacity must be positive");
+		Self {
+			entries: Mutex::new(HashMap::new()),
+			capacity,
+		}
+	}
+
+	fn issue(
+		self: &Arc<Self>,
+		scope: AccountRequestScope,
+	) -> anyhow::Result<BridgeIdentityLease> {
+		for _ in 0..4 {
+			let mut bytes = Zeroizing::new([0_u8; 24]);
+			getrandom::fill(bytes.as_mut())
+				.map_err(|error| anyhow::anyhow!("failed to create bridge identity lease: {error}"))?;
+			let token = URL_SAFE_NO_PAD.encode(bytes.as_ref());
+			let mut entries = self
+				.entries
+				.lock()
+				.map_err(|_| anyhow::anyhow!("bridge identity registry is unavailable"))?;
+			if entries.len() >= self.capacity {
+				anyhow::bail!("bridge identity registry capacity reached");
+			}
+			if entries.insert(token.clone(), scope).is_none() {
+				return Ok(BridgeIdentityLease {
+					registry: Arc::clone(self),
+					token,
+				});
+			}
+		}
+		anyhow::bail!("failed to allocate a unique bridge identity lease")
+	}
+
+	fn resolve(&self, token: &str) -> Option<AccountRequestScope> {
+		self.entries
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.get(token)
+			.copied()
+	}
+
+	fn remove(&self, token: &str) {
+		self.entries
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.remove(token);
+	}
+}
+
+struct BridgeIdentityLease {
+	registry: Arc<BridgeIdentityRegistry>,
+	token: String,
+}
+
+impl BridgeIdentityLease {
+	fn token(&self) -> &str {
+		&self.token
+	}
+}
+
+impl Drop for BridgeIdentityLease {
+	fn drop(&mut self) {
+		self.registry.remove(&self.token);
+		self.token.zeroize();
+	}
+}
+
+#[derive(Clone)]
+struct AuthenticatedIngressRuntime {
+	accounts: Arc<AccountManager>,
+	downstream_contexts: Arc<AuthenticatedDownstreamStore>,
+	bridge_identities: Arc<BridgeIdentityRegistry>,
+	isolation_hasher: TenantIsolationHasher,
+	usage_period: Duration,
+}
+
+impl AuthenticatedIngressRuntime {
+	fn period_start(&self) -> Result<UnixTimestamp, account_management::AccountManagementError> {
+		UnixTimestamp::period_start_now(self.usage_period)
+	}
+}
+
+#[derive(Clone)]
+enum PublicIngressRuntime {
+	Development {
+		listen_addr: SocketAddr,
+	},
+	AuthenticatedTls {
+		listen_addr: SocketAddr,
+		acceptor: TlsAcceptor,
+		handshake_timeout: Duration,
+		first_request_timeout: Duration,
+		handshake_semaphore: Arc<Semaphore>,
+		max_client_connections: usize,
+		authentication: AuthenticatedIngressRuntime,
+	},
+}
+
+impl PublicIngressRuntime {
+	fn listen_addr(&self) -> SocketAddr {
+		match self {
+			Self::Development { listen_addr }
+			| Self::AuthenticatedTls { listen_addr, .. } => *listen_addr,
+		}
+	}
+
+	fn max_client_connections(&self) -> usize {
+		match self {
+			Self::Development { .. } => MAX_CONNECTION_TASKS,
+			Self::AuthenticatedTls {
+				max_client_connections,
+				..
+			} => *max_client_connections,
+		}
+	}
+
+	fn authentication(&self) -> Option<AuthenticatedIngressRuntime> {
+		match self {
+			Self::Development { .. } => None,
+			Self::AuthenticatedTls { authentication, .. } => Some(authentication.clone()),
+		}
+	}
+}
+
+fn configured_public_ingress() -> anyhow::Result<PublicIngressRuntime> {
+	match RuntimeIngressConfig::from_environment()? {
+		RuntimeIngressConfig::Development { listen_addr } => {
+			Ok(PublicIngressRuntime::Development { listen_addr })
+		}
+		RuntimeIngressConfig::Production {
+			tls,
+			account_database,
+			api_key_hash_key_file,
+			max_cached_accounts,
+			usage_period,
+		} => {
+			let server_config = load_server_config(&tls)?;
+			let api_key_hasher = ApiKeyHasher::from_key_file(&api_key_hash_key_file)?;
+			let accounts = Arc::new(AccountManager::open(
+				&account_database,
+				api_key_hasher,
+				max_cached_accounts,
+			)?);
+			let bridge_identity_capacity = tls
+				.capacity
+				.max_client_connections
+				.checked_mul(4)
+				.ok_or_else(|| anyhow::anyhow!("bridge identity capacity overflow"))?;
+			let authentication = AuthenticatedIngressRuntime {
+				accounts,
+				downstream_contexts: Arc::new(AuthenticatedDownstreamStore::new(
+					tls.capacity.max_client_connections,
+				)),
+				bridge_identities: Arc::new(BridgeIdentityRegistry::new(
+					bridge_identity_capacity,
+				)),
+				isolation_hasher: TenantIsolationHasher::new()?,
+				usage_period,
+			};
+			Ok(PublicIngressRuntime::AuthenticatedTls {
+				listen_addr: tls.listen_addr,
+				acceptor: TlsAcceptor::from(server_config),
+				handshake_timeout: tls.timeouts.tls_handshake,
+				first_request_timeout: tls.timeouts.first_request,
+				handshake_semaphore: Arc::new(Semaphore::new(
+					tls.capacity.max_concurrent_handshakes,
+				)),
+				max_client_connections: tls.capacity.max_client_connections,
+				authentication,
+			})
+		}
 	}
 }
 
@@ -478,20 +831,49 @@ fn cache_status_header(cache: &HttpCache) -> &'static str {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedProxyRequest {
 	method: String,
 	destination: Option<String>,
 	header_len: usize,
 	isolation: IsolationRequest,
+	proxy_authorization: Option<Zeroizing<String>>,
+	internal_identity: Option<String>,
 }
 
-fn isolation_request_from_httparse_headers(
+impl fmt::Debug for ParsedProxyRequest {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter
+			.debug_struct("ParsedProxyRequest")
+			.field("method", &self.method)
+			.field("destination", &self.destination)
+			.field("header_len", &self.header_len)
+			.field("isolation", &self.isolation)
+			.field(
+				"proxy_authorization",
+				&self.proxy_authorization.as_ref().map(|_| "[redacted]"),
+			)
+			.field(
+				"internal_identity",
+				&self.internal_identity.as_ref().map(|_| "[redacted]"),
+			)
+			.finish()
+	}
+}
+
+struct ParsedIngressHeaders {
+	isolation: IsolationRequest,
+	proxy_authorization: Option<Zeroizing<String>>,
+	internal_identity: Option<String>,
+}
+
+fn ingress_headers_from_httparse(
 	headers: &[httparse::Header<'_>],
-) -> anyhow::Result<IsolationRequest> {
+) -> anyhow::Result<ParsedIngressHeaders> {
 	let mut identity = None;
 	let mut strict = false;
 	let mut mode_seen = false;
+	let mut proxy_authorization = None;
+	let mut internal_identity = None;
 	for header in headers {
 		if header.name.eq_ignore_ascii_case(ISOLATION_HEADER) {
 			if identity.is_some() {
@@ -504,9 +886,25 @@ fn isolation_request_from_httparse_headers(
 			}
 			strict = parse_isolation_mode(header.value)?;
 			mode_seen = true;
+		} else if header.name.eq_ignore_ascii_case(PROXY_AUTHORIZATION_HEADER) {
+			if proxy_authorization.is_some() {
+				anyhow::bail!("duplicate proxy authorization header");
+			}
+			let value = std::str::from_utf8(header.value)
+				.map_err(|_| anyhow::anyhow!("proxy authorization is not valid UTF-8"))?;
+			proxy_authorization = Some(Zeroizing::new(value.to_owned()));
+		} else if header.name.eq_ignore_ascii_case(INTERNAL_IDENTITY_HEADER) {
+			if internal_identity.is_some() {
+				anyhow::bail!("duplicate internal identity header");
+			}
+			internal_identity = Some(validate_isolation_identity(header.value)?);
 		}
 	}
-	Ok(IsolationRequest { identity, strict })
+	Ok(ParsedIngressHeaders {
+		isolation: IsolationRequest { identity, strict },
+		proxy_authorization,
+		internal_identity,
+	})
 }
 
 fn take_isolation_request(request: &mut RequestHeader) -> anyhow::Result<IsolationRequest> {
@@ -536,6 +934,8 @@ fn take_isolation_request(request: &mut RequestHeader) -> anyhow::Result<Isolati
 
 	request.remove_header(ISOLATION_HEADER);
 	request.remove_header(ISOLATION_MODE_HEADER);
+	request.remove_header(PROXY_AUTHORIZATION_HEADER);
+	request.remove_header(INTERNAL_IDENTITY_HEADER);
 	Ok(IsolationRequest { identity, strict })
 }
 
@@ -568,14 +968,63 @@ fn parse_proxy_request(buffer: &[u8]) -> anyhow::Result<Option<ParsedProxyReques
 	} else {
 		None
 	};
-	let isolation = isolation_request_from_httparse_headers(request.headers)?;
+	let ingress_headers = ingress_headers_from_httparse(request.headers)?;
 
 	Ok(Some(ParsedProxyRequest {
 		method: method.to_owned(),
 		destination,
 		header_len,
-		isolation,
+		isolation: ingress_headers.isolation,
+		proxy_authorization: ingress_headers.proxy_authorization,
+		internal_identity: ingress_headers.internal_identity,
 	}))
+}
+
+fn strip_ingress_headers(buffer: &[u8], header_len: usize) -> anyhow::Result<Vec<u8>> {
+	if header_len > buffer.len() {
+		anyhow::bail!("parsed header length exceeds buffered request");
+	}
+	let mut headers = [httparse::EMPTY_HEADER; MAX_CONNECT_HEADERS];
+	let mut parsed = httparse::Request::new(&mut headers);
+	let status = parsed
+		.parse(&buffer[..header_len])
+		.map_err(|error| anyhow::anyhow!("malformed HTTP request: {error}"))?;
+	if !status.is_complete() {
+		anyhow::bail!("request header unexpectedly became incomplete");
+	}
+	let method = parsed
+		.method
+		.ok_or_else(|| anyhow::anyhow!("HTTP request is missing a method"))?;
+	let path = parsed
+		.path
+		.ok_or_else(|| anyhow::anyhow!("HTTP request is missing a target"))?;
+	let version = parsed
+		.version
+		.ok_or_else(|| anyhow::anyhow!("HTTP request is missing a version"))?;
+
+	let mut sanitized = Vec::with_capacity(buffer.len());
+	sanitized.extend_from_slice(method.as_bytes());
+	sanitized.push(b' ');
+	sanitized.extend_from_slice(path.as_bytes());
+	sanitized.extend_from_slice(b" HTTP/1.");
+	sanitized.extend_from_slice(version.to_string().as_bytes());
+	sanitized.extend_from_slice(b"\r\n");
+	for header in parsed.headers {
+		if header.name.eq_ignore_ascii_case(PROXY_AUTHORIZATION_HEADER)
+			|| header.name.eq_ignore_ascii_case(ISOLATION_HEADER)
+			|| header.name.eq_ignore_ascii_case(ISOLATION_MODE_HEADER)
+			|| header.name.eq_ignore_ascii_case(INTERNAL_IDENTITY_HEADER)
+		{
+			continue;
+		}
+		sanitized.extend_from_slice(header.name.as_bytes());
+		sanitized.extend_from_slice(b": ");
+		sanitized.extend_from_slice(header.value);
+		sanitized.extend_from_slice(b"\r\n");
+	}
+	sanitized.extend_from_slice(b"\r\n");
+	sanitized.extend_from_slice(&buffer[header_len..]);
+	Ok(sanitized)
 }
 
 fn parse_connect_request(buffer: &[u8]) -> anyhow::Result<Option<(String, usize)>> {
@@ -694,7 +1143,9 @@ where
 	}
 }
 
-async fn read_connect_request<S>(stream: &mut S) -> anyhow::Result<(String, IsolationRequest, Vec<u8>)>
+async fn read_connect_request<S>(
+	stream: &mut S,
+) -> anyhow::Result<(String, IsolationRequest, Option<String>, Vec<u8>)>
 where
 	S: tokio::io::AsyncRead + Unpin,
 {
@@ -705,6 +1156,7 @@ where
 	Ok((
 		request.destination.unwrap(),
 		request.isolation,
+		request.internal_identity,
 		buffer[request.header_len..].to_vec(),
 	))
 }
@@ -713,12 +1165,17 @@ pub struct Proxy{
 	request_counter: AtomicUsize,
 	cache: Arc<IsolationStore>,
 	metrics: Arc<CircuitMetrics>,
+	authentication: Option<AuthenticatedIngressRuntime>,
 	//isolation_manager: IsolationHelper,
 	tor_client: Arc<TorClient<PreferredRuntime>>
 }
 
 pub struct RequestCtx{
 	id: Option<i64>,
+	account_id: Option<AccountId>,
+	ingress_identity: Option<IngressIdentity>,
+	usage_period_start: Option<UnixTimestamp>,
+	bridge_identity_lease: Option<BridgeIdentityLease>,
 	token: IsolationToken,
 	isolation_identity: String,
 	isolation_group_key: u64,
@@ -1433,6 +1890,7 @@ async fn copy_one_direction<R, W>(
 	mut writer: W,
 	activity: watch::Sender<u64>,
 	byte_counter: Option<&AtomicU64>,
+	secondary_byte_counter: Option<&AtomicU64>,
 ) -> io::Result<u64>
 where
 	R: tokio::io::AsyncRead + Unpin,
@@ -1461,6 +1919,9 @@ where
 		writer.flush().await?;
 		bytes_copied = bytes_copied.saturating_add(read as u64);
 		if let Some(byte_counter) = byte_counter {
+			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
+		}
+		if let Some(byte_counter) = secondary_byte_counter {
 			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
 		}
 		activity.send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1507,14 +1968,51 @@ where
 	A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+	copy_bidirectional_with_idle_timeout_and_counter_sets(
+		a,
+		b,
+		idle_timeout,
+		bytes_a_to_b,
+		bytes_b_to_a,
+		None,
+		None,
+	)
+	.await
+}
+
+async fn copy_bidirectional_with_idle_timeout_and_counter_sets<A, B>(
+	a: &mut A,
+	b: &mut B,
+	idle_timeout: Duration,
+	bytes_a_to_b: Option<&AtomicU64>,
+	bytes_b_to_a: Option<&AtomicU64>,
+	secondary_bytes_a_to_b: Option<&AtomicU64>,
+	secondary_bytes_b_to_a: Option<&AtomicU64>,
+) -> io::Result<(u64, u64)>
+where
+	A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
 	let (a_reader, a_writer) = tokio::io::split(a);
 	let (b_reader, b_writer) = tokio::io::split(b);
 	let (activity, mut activity_rx) = watch::channel(0_u64);
 	let activity_reverse = activity.clone();
 	let copy = async move {
 		tokio::try_join!(
-			copy_one_direction(a_reader, b_writer, activity, bytes_a_to_b),
-			copy_one_direction(b_reader, a_writer, activity_reverse, bytes_b_to_a),
+			copy_one_direction(
+				a_reader,
+				b_writer,
+				activity,
+				bytes_a_to_b,
+				secondary_bytes_a_to_b,
+			),
+			copy_one_direction(
+				b_reader,
+				a_writer,
+				activity_reverse,
+				bytes_b_to_a,
+				secondary_bytes_b_to_a,
+			),
 		)
 	};
 	tokio::pin!(copy);
@@ -1564,13 +2062,102 @@ where
 	}
 }
 
+#[derive(Debug)]
+enum RuntimeAuthenticationError {
+	Account(AuthenticationError),
+	Worker(JoinError),
+}
+
+#[derive(Debug)]
+enum RuntimeUsageAdmissionError {
+	Account(UsageAdmissionError),
+	Worker(JoinError),
+}
+
+async fn accept_bounded_tls<S>(
+	stream: S,
+	acceptor: TlsAcceptor,
+	handshake_semaphore: Arc<Semaphore>,
+	handshake_timeout: Duration,
+) -> anyhow::Result<TlsStream<S>>
+where
+	S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	let handshake_permit = handshake_semaphore
+		.try_acquire_owned()
+		.map_err(|_| anyhow::anyhow!("TLS handshake capacity reached"))?;
+	let tls_stream = tokio::time::timeout(handshake_timeout, acceptor.accept(stream))
+		.await
+		.map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
+		.map_err(|error| anyhow::anyhow!("TLS handshake failed: {error}"))?;
+	drop(handshake_permit);
+	Ok(tls_stream)
+}
+
+fn tls_client_fingerprint<S>(stream: &TlsStream<S>) -> anyhow::Result<CertificateFingerprint> {
+	let (_, connection) = stream.get_ref();
+	validate_negotiated_alpn(connection.alpn_protocol())?;
+	let certificates = connection
+		.peer_certificates()
+		.ok_or_else(|| anyhow::anyhow!("mTLS connection has no peer certificate"))?;
+	let leaf = certificates
+		.first()
+		.ok_or_else(|| anyhow::anyhow!("mTLS connection has an empty peer certificate chain"))?;
+	let digest = Sha256::digest(leaf.as_ref());
+	let mut fingerprint = [0_u8; 32];
+	fingerprint.copy_from_slice(&digest);
+	Ok(CertificateFingerprint::from_sha256(fingerprint))
+}
+
+async fn authenticate_account(
+	accounts: Arc<AccountManager>,
+	proxy_authorization: Zeroizing<String>,
+	fingerprint: CertificateFingerprint,
+) -> std::result::Result<IngressIdentity, RuntimeAuthenticationError> {
+	tokio::task::spawn_blocking(move || {
+		accounts.authenticate_ingress(proxy_authorization.as_str(), &fingerprint)
+	})
+	.await
+	.map_err(RuntimeAuthenticationError::Worker)?
+	.map_err(RuntimeAuthenticationError::Account)
+}
+
+async fn admit_account_request(
+	accounts: Arc<AccountManager>,
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+) -> std::result::Result<(), RuntimeUsageAdmissionError> {
+	tokio::task::spawn_blocking(move || accounts.admit_request(identity, period_start))
+		.await
+		.map_err(RuntimeUsageAdmissionError::Worker)?
+		.map(|_| ())
+		.map_err(RuntimeUsageAdmissionError::Account)
+}
+
+async fn record_account_bytes(
+	accounts: Arc<AccountManager>,
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+	bytes_to_tor: u64,
+	bytes_from_tor: u64,
+) -> anyhow::Result<()> {
+	let delta = UsageDelta::new(0, bytes_to_tor, bytes_from_tor)?;
+	tokio::task::spawn_blocking(move || accounts.record_usage(identity, period_start, delta))
+		.await
+		.map_err(|error| anyhow::anyhow!("account usage worker failed: {error}"))??;
+	Ok(())
+}
+
 #[derive(Clone)]
 pub struct Bridge{
 	tor: Arc<TorClient<PreferredRuntime>>,
 	token_store: Arc<IsolationStore>,
+	public_ingress: PublicIngressRuntime,
+	authentication: Option<AuthenticatedIngressRuntime>,
 	circuit_semaphore: Arc<Semaphore>,
 	tunnel_semaphore: Arc<Semaphore>,
-	connection_semaphore: Arc<Semaphore>,
+	public_connection_semaphore: Arc<Semaphore>,
+	internal_connection_semaphore: Arc<Semaphore>,
 	circuit_breaker: Arc<CircuitBreaker>,
 	circuit_metrics: Arc<CircuitMetrics>,
 	//port: u16
@@ -1618,11 +2205,12 @@ impl TorCircuit {
 		token_store: Arc<IsolationStore>,
 		metrics: Arc<CircuitMetrics>,
 		drain_config: BridgeTaskDrainConfig,
+		public_ingress: PublicIngressRuntime,
 	) -> BridgeShutdown {
 		let tor = self.client();
 		let (shutdown, shutdown_receiver) = watch::channel(false);
 		self.runtime.spawn(async move {
-			if let Err(_error) = Bridge::new(tor, token_store, metrics)
+			if let Err(_error) = Bridge::new(tor, token_store, metrics, public_ingress)
 				.run_bridge(shutdown_receiver, drain_config)
 				.await
 			{
@@ -1678,6 +2266,10 @@ impl ProxyHttp for Proxy {
 	fn new_ctx(&self) -> Self::CTX {
 		RequestCtx{
 			id: None,
+			account_id: None,
+			ingress_identity: None,
+			usage_period_start: None,
+			bridge_identity_lease: None,
 			token: IsolationToken::new(),
 			isolation_identity: String::new(),
 			isolation_group_key: 0,
@@ -1720,6 +2312,12 @@ impl ProxyHttp for Proxy {
 			ISOLATION_MODE_HEADER.to_owned(),
 			if ctx.strict_isolation { b"strict".to_vec() } else { b"session".to_vec() },
 		);
+		if let Some(lease) = &ctx.bridge_identity_lease {
+			proxy_headers.insert(
+				INTERNAL_IDENTITY_HEADER.to_owned(),
+				lease.token().as_bytes().to_vec(),
+			);
+		}
 		peer.proxy = Some(CrateProxy {
 			next_hop: Box::from(Path::new(BRIDGE_SOCKET)),
 			host,
@@ -1737,6 +2335,8 @@ impl ProxyHttp for Proxy {
 	) -> Result<()> {
 		upstream_request.remove_header(ISOLATION_HEADER);
 		upstream_request.remove_header(ISOLATION_MODE_HEADER);
+		upstream_request.remove_header(PROXY_AUTHORIZATION_HEADER);
+		upstream_request.remove_header(INTERNAL_IDENTITY_HEADER);
 		if ctx.strict_isolation {
 			upstream_request.insert_header(http::header::CONNECTION, "close")?;
 		}
@@ -1748,11 +2348,56 @@ impl ProxyHttp for Proxy {
 		session: &mut Session,
 		ctx: &mut Self::CTX,
 	) -> Result<bool> {
+		let isolation = if let Some(authentication) = &self.authentication {
+			let Some(client_address) = session
+				.client_addr()
+				.and_then(|address| address.as_inet())
+				.copied()
+			else {
+				session.respond_error(403).await?;
+				return Ok(true);
+			};
+			let Some(authenticated_context) =
+				authentication.downstream_contexts.context(&client_address)
+			else {
+				session.respond_error(403).await?;
+				return Ok(true);
+			};
+			let _discarded_ingress_headers = take_isolation_request(session.req_header_mut())
+				.map_err(|error| {
+					Error::because(InvalidHTTPHeader, "invalid isolation header", error)
+				})?;
+			let destination = canonical_cache_key_parts(session.req_header())
+				.map_err(|error| {
+					Error::because(InvalidHTTPHeader, "invalid request destination", error)
+				})?
+				.0;
+			let scope = authenticated_context.scope;
+			let lease = authentication
+				.bridge_identities
+				.issue(scope)
+				.map_err(|error| {
+					Error::because(InternalError, "failed to issue bridge identity", error)
+				})?;
+			ctx.account_id = Some(scope.identity.account_id());
+			ctx.ingress_identity = Some(scope.identity);
+			ctx.usage_period_start = Some(scope.period_start);
+			ctx.bridge_identity_lease = Some(lease);
+			session.as_downstream_mut().set_keepalive(None);
+			authentication.isolation_hasher.resolve(
+				scope.identity,
+				&destination,
+				authenticated_context.isolation,
+			)
+		} else {
+			let isolation_request = take_isolation_request(session.req_header_mut())
+				.map_err(|error| {
+					Error::because(InvalidHTTPHeader, "invalid isolation header", error)
+				})?;
+			resolve_isolation(isolation_request)
+		};
 		let new_id = self.request_counter.fetch_add(1, Ordering::Relaxed);
 		ctx.id = Some(new_id as i64);
-		let isolation_request = take_isolation_request(session.req_header_mut())
-			.map_err(|error| Error::because(InvalidHTTPHeader, "invalid isolation header", error))?;
-		let isolation = resolve_isolation(isolation_request);
 		ctx.strict_isolation = isolation.strict;
 		ctx.isolation_identity = isolation.identity;
 		let material = if ctx.strict_isolation {
@@ -1942,13 +2587,19 @@ impl Bridge {
 		tor: Arc<TorClient<PreferredRuntime>>,
 		token_store: Arc<IsolationStore>,
 		circuit_metrics: Arc<CircuitMetrics>,
+		public_ingress: PublicIngressRuntime,
 	) -> Self {
+		let authentication = public_ingress.authentication();
+		let max_client_connections = public_ingress.max_client_connections();
 		Self {
 			tor,
-				token_store,
+			token_store,
+			public_ingress,
+			authentication,
 			circuit_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_CIRCUIT_BUILDS)),
 			tunnel_semaphore: Arc::new(Semaphore::new(MAX_ACTIVE_TUNNELS)),
-			connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTION_TASKS)),
+			public_connection_semaphore: Arc::new(Semaphore::new(max_client_connections)),
+			internal_connection_semaphore: Arc::new(Semaphore::new(MAX_CONNECTION_TASKS)),
 			circuit_breaker: Arc::new(CircuitBreaker::new(
 				MAX_BREAKER_ENTRIES,
 				BREAKER_FAILURE_THRESHOLD,
@@ -1974,7 +2625,7 @@ impl Bridge {
 			use std::os::unix::fs::PermissionsExt;
 			std::fs::set_permissions(BRIDGE_SOCKET, std::fs::Permissions::from_mode(0o600))?;
 		}
-		let public_listener = TcpListener::bind(PUBLIC_PROXY_ADDR).await?;
+		let public_listener = TcpListener::bind(self.public_ingress.listen_addr()).await?;
 		let prometheus_listener = TcpListener::bind(PROMETHEUS_ADDR).await?;
 		let mut interval = tokio::time::interval(CIRCUIT_METRICS_LOG_INTERVAL);
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2014,7 +2665,7 @@ impl Bridge {
 				accepted = listener.accept() => match accepted {
 					Ok((mut stream, _)) => {
 						let connection_permit = match self
-							.connection_semaphore
+							.internal_connection_semaphore
 							.clone()
 							.try_acquire_owned()
 						{
@@ -2039,18 +2690,20 @@ impl Bridge {
 					},
 					accepted = public_listener.accept() => match accepted {
 						Ok((mut stream, _)) => {
-							let connection_permit = match self.connection_semaphore.clone().try_acquire_owned() {
+							let connection_permit = match self.public_connection_semaphore.clone().try_acquire_owned() {
 								Ok(permit) => permit,
 								Err(_) => {
 									self.circuit_metrics.rejected_tunnels.fetch_add(1, Ordering::Relaxed);
-									let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
+									if matches!(&self.public_ingress, PublicIngressRuntime::Development { .. }) {
+										let _ = stream.write_all(CIRCUIT_CAPACITY_RESPONSE).await;
+									}
 									continue;
 								}
 							};
 							let bridge = self.clone();
 							task_registry.spawn(BridgeTaskKind::Public, async move {
 								let _connection_permit = connection_permit;
-								let result = bridge.handle_public_connection(stream).await;
+								let result = bridge.handle_public_tcp_connection(stream).await;
 								if let Err(error) = &result {
 									eprintln!("[bridge] ingress connection error: {error:#}");
 								}
@@ -2084,9 +2737,60 @@ impl Bridge {
 		Ok(())
 	}
 
-	async fn handle_public_connection(&self, mut stream: TcpStream) -> anyhow::Result<()> {
+	async fn handle_public_tcp_connection(&self, stream: TcpStream) -> anyhow::Result<()> {
+		match self.public_ingress.clone() {
+			PublicIngressRuntime::Development { .. } => {
+				self.handle_public_connection(stream, None, None).await
+			}
+			PublicIngressRuntime::AuthenticatedTls {
+				acceptor,
+				handshake_timeout,
+				first_request_timeout,
+				handshake_semaphore,
+				authentication,
+				..
+			} => {
+				let tls_stream = accept_bounded_tls(
+					stream,
+					acceptor,
+					handshake_semaphore,
+					handshake_timeout,
+				)
+				.await?;
+				let fingerprint = tls_client_fingerprint(&tls_stream)?;
+				self.handle_public_connection(
+					tls_stream,
+					Some((authentication, fingerprint)),
+					Some(first_request_timeout),
+				)
+				.await
+			}
+		}
+	}
+
+	async fn handle_public_connection<S>(
+		&self,
+		mut stream: S,
+		authentication: Option<(AuthenticatedIngressRuntime, CertificateFingerprint)>,
+		first_request_timeout: Option<Duration>,
+	) -> anyhow::Result<()>
+	where
+		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
 		let ingress_started = tokio::time::Instant::now();
-		let (request, buffer) = match read_proxy_request(&mut stream).await {
+		let request_result = match first_request_timeout {
+			Some(timeout) => match tokio::time::timeout(timeout, read_proxy_request(&mut stream)).await {
+				Ok(result) => result,
+				Err(_) => {
+					let _ = stream.write_all(REQUEST_TIMEOUT_RESPONSE).await;
+					self.circuit_metrics
+						.record_request("OTHER", 408, ingress_started.elapsed());
+					anyhow::bail!("first proxy request timed out");
+				}
+			},
+			None => read_proxy_request(&mut stream).await,
+		};
+		let (mut request, buffer) = match request_result {
 			Ok(request) => request,
 			Err(error) => {
 				let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
@@ -2094,15 +2798,161 @@ impl Bridge {
 				return Err(error);
 			}
 		};
+		let mut buffer = Zeroizing::new(buffer);
+		if request.internal_identity.is_some() {
+			let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
+			self.circuit_metrics
+				.record_request(&request.method, 400, ingress_started.elapsed());
+			anyhow::bail!("public request supplied a reserved internal identity header");
+		}
+
+		let account_scope = if let Some((authentication, fingerprint)) = authentication {
+			let Some(proxy_authorization) = request.proxy_authorization.take() else {
+				let _ = stream.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await;
+				self.circuit_metrics
+					.record_request(&request.method, 407, ingress_started.elapsed());
+				anyhow::bail!("proxy authorization is required");
+			};
+			let identity = match authenticate_account(
+				authentication.accounts.clone(),
+				proxy_authorization,
+				fingerprint,
+			)
+			.await
+			{
+				Ok(identity) => identity,
+				Err(RuntimeAuthenticationError::Account(
+					AuthenticationError::InvalidAuthorization(_)
+					| AuthenticationError::InvalidApiKey
+					| AuthenticationError::ApiKeyRevoked,
+				)) => {
+					let _ = stream.write_all(PROXY_AUTH_REQUIRED_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 407, ingress_started.elapsed());
+					anyhow::bail!("proxy authorization was rejected");
+				}
+				Err(RuntimeAuthenticationError::Account(
+					AuthenticationError::AccountInactive
+					| AuthenticationError::WorkspaceInactive
+					| AuthenticationError::UnknownDevice
+					| AuthenticationError::DeviceRevoked
+					| AuthenticationError::CredentialScopeMismatch,
+				)) => {
+					let _ = stream.write_all(FORBIDDEN_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 403, ingress_started.elapsed());
+					anyhow::bail!("authenticated account or device is not permitted");
+				}
+				Err(RuntimeAuthenticationError::Account(AuthenticationError::Storage(_))) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("account authentication service is unavailable");
+				}
+				Err(RuntimeAuthenticationError::Worker(error)) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("account authentication worker failed: {error}");
+				}
+			};
+			if let Err(error) = authentication.accounts.check_request_rate(identity) {
+				let response = if matches!(error, AccountAdmissionError::RateLimited { .. }) {
+					RATE_LIMITED_RESPONSE
+				} else {
+					SERVICE_UNAVAILABLE_RESPONSE
+				};
+				let status = if matches!(error, AccountAdmissionError::RateLimited { .. }) {
+					429
+				} else {
+					503
+				};
+				let _ = stream.write_all(response).await;
+				self.circuit_metrics
+					.record_request(&request.method, status, ingress_started.elapsed());
+				anyhow::bail!("account request admission failed: {error}");
+			}
+			let period_start = match authentication.period_start() {
+				Ok(period_start) => period_start,
+				Err(error) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					return Err(error.into());
+				}
+			};
+			match admit_account_request(
+				authentication.accounts.clone(),
+				identity,
+				period_start,
+			)
+			.await
+			{
+				Ok(()) => {}
+				Err(RuntimeUsageAdmissionError::Account(
+					UsageAdmissionError::Quota(_),
+				)) => {
+					let _ = stream.write_all(QUOTA_EXCEEDED_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 429, ingress_started.elapsed());
+					anyhow::bail!("account period quota reached");
+				}
+				Err(RuntimeUsageAdmissionError::Account(
+					UsageAdmissionError::Storage(_),
+				)) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("account usage admission service is unavailable");
+				}
+				Err(RuntimeUsageAdmissionError::Worker(error)) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("account usage admission worker failed: {error}");
+				}
+			}
+			Some((
+				authentication,
+				AccountRequestScope {
+					identity,
+					period_start,
+				},
+			))
+		} else {
+			None
+		};
 
 		if request.method.eq_ignore_ascii_case("CONNECT") {
 			let destination = request.destination.unwrap();
 			let buffered_tunnel_data = buffer[request.header_len..].to_vec();
+			buffer[..request.header_len].zeroize();
 			return self
-				.handle_connect_request(stream, destination, request.isolation, buffered_tunnel_data, true)
+				.handle_connect_request(
+					stream,
+					destination,
+					request.isolation,
+					buffered_tunnel_data,
+					true,
+					account_scope,
+				)
 				.await;
 		}
 
+		let sanitized_buffer = if let Some((authentication, scope)) = &account_scope {
+			let sanitized = strip_ingress_headers(&buffer, request.header_len)?;
+			buffer[..request.header_len].zeroize();
+			Some((
+				sanitized,
+				authentication.clone(),
+				AuthenticatedRequestContext {
+					scope: *scope,
+					isolation: request.isolation,
+				},
+			))
+		} else {
+			None
+		};
 		let mut pingora_stream = match TcpStream::connect(INTERNAL_PROXY_ADDR).await {
 			Ok(stream) => stream,
 			Err(error) => {
@@ -2110,7 +2960,29 @@ impl Bridge {
 				return Err(anyhow::anyhow!("failed to reach internal Pingora service: {error}"));
 			}
 		};
-		pingora_stream.write_all(&buffer).await?;
+		let _authenticated_downstream_guard = if let Some((
+			sanitized,
+			authentication,
+			context,
+		)) = sanitized_buffer
+		{
+			let address = pingora_stream.local_addr()?;
+			let guard = match authentication
+				.downstream_contexts
+				.register(address, context)
+			{
+				Ok(guard) => guard,
+				Err(error) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					return Err(error);
+				}
+			};
+			pingora_stream.write_all(&sanitized).await?;
+			Some(guard)
+		} else {
+			pingora_stream.write_all(&buffer).await?;
+			None
+		};
 		copy_bidirectional_with_idle_timeout(
 			&mut stream,
 			&mut pingora_stream,
@@ -2120,14 +2992,41 @@ impl Bridge {
 	}
 
 	async fn handle_internal_connect(&self, mut stream: UnixStream) -> anyhow::Result<()> {
-		let (dest, isolation, buffered_tunnel_data) = match read_connect_request(&mut stream).await {
+		let (dest, isolation, internal_identity, buffered_tunnel_data) =
+			match read_connect_request(&mut stream).await {
 			Ok(request) => request,
 			Err(error) => {
 				let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
 				return Err(error);
 			}
 		};
-		self.handle_connect_request(stream, dest, isolation, buffered_tunnel_data, false).await
+		let account_scope = match (&self.authentication, internal_identity) {
+			(Some(authentication), Some(token)) => {
+				let Some(scope) = authentication.bridge_identities.resolve(&token) else {
+					let _ = stream.write_all(FORBIDDEN_RESPONSE).await;
+					anyhow::bail!("internal account identity lease was rejected");
+				};
+				Some((authentication.clone(), scope))
+			}
+			(Some(_), None) => {
+				let _ = stream.write_all(FORBIDDEN_RESPONSE).await;
+				anyhow::bail!("authenticated internal proxy request is missing its identity lease");
+			}
+			(None, Some(_)) => {
+				let _ = stream.write_all(BAD_REQUEST_RESPONSE).await;
+				anyhow::bail!("development proxy request supplied an internal identity lease");
+			}
+			(None, None) => None,
+		};
+		self.handle_connect_request(
+			stream,
+			dest,
+			isolation,
+			buffered_tunnel_data,
+			false,
+			account_scope,
+		)
+		.await
 	}
 
 	async fn connect_with_retry(
@@ -2196,6 +3095,7 @@ impl Bridge {
 		isolation_request: IsolationRequest,
 		buffered_tunnel_data: Vec<u8>,
 		count_as_public_request: bool,
+		account_scope: Option<(AuthenticatedIngressRuntime, AccountRequestScope)>,
 	) -> anyhow::Result<()>
 	where
 		S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -2233,6 +3133,23 @@ impl Bridge {
 			anyhow::bail!("destination circuit breaker is open");
 		}
 
+		let _account_tunnel_guard = if let Some((authentication, scope)) = &account_scope {
+			match authentication.accounts.try_acquire_tunnel(scope.identity) {
+				Ok(guard) => Some(guard),
+				Err(AccountAdmissionError::TunnelLimitReached { .. }) => {
+					observation.finish(429, "account_tunnel_capacity");
+					let _ = stream.write_all(RATE_LIMITED_RESPONSE).await;
+					anyhow::bail!("account concurrent tunnel limit reached");
+				}
+				Err(error) => {
+					observation.finish(503, "account_admission");
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					anyhow::bail!("account tunnel admission failed: {error}");
+				}
+			}
+		} else {
+			None
+		};
 		let _active_tunnel_permit = match acquire_active_tunnel_permit(
 			&mut stream,
 			self.tunnel_semaphore.clone(),
@@ -2245,7 +3162,12 @@ impl Bridge {
 				return Err(error);
 			}
 		};
-		let isolation = resolve_isolation(isolation_request);
+		let isolation = match &account_scope {
+			Some((authentication, scope)) if count_as_public_request => authentication
+				.isolation_hasher
+				.resolve(scope.identity, &breaker_key, isolation_request),
+			_ => resolve_isolation(isolation_request),
+		};
 		let circuit_permit = match acquire_circuit_permit(
 			&mut stream,
 			self.circuit_semaphore.clone(),
@@ -2284,6 +3206,8 @@ impl Bridge {
 				anyhow::bail!("Tor connection failed with class {:?}", error.kind());
 			}
 		};
+		let account_bytes_to_tor = AtomicU64::new(0);
+		let account_bytes_from_tor = AtomicU64::new(0);
 		if !buffered_tunnel_data.is_empty() {
 			tor_stream.write_all(&buffered_tunnel_data).await?;
 			// These bytes were read alongside the CONNECT header and bypass the
@@ -2292,26 +3216,58 @@ impl Bridge {
 			self.circuit_metrics
 				.bytes_to_tor
 				.fetch_add(buffered_tunnel_data.len() as u64, Ordering::Relaxed);
+			if account_scope.is_some() {
+				account_bytes_to_tor
+					.fetch_add(buffered_tunnel_data.len() as u64, Ordering::Relaxed);
+			}
 		}
 
-		let (_bytes_to_tor, _bytes_from_tor) = match copy_bidirectional_with_idle_timeout_and_counters(
+		let copy_result = copy_bidirectional_with_idle_timeout_and_counter_sets(
 			&mut stream,
 			&mut tor_stream,
 			TUNNEL_IDLE_TIMEOUT,
 			Some(&self.circuit_metrics.bytes_to_tor),
 			Some(&self.circuit_metrics.bytes_from_tor),
-		).await {
+			account_scope.as_ref().map(|_| &account_bytes_to_tor),
+			account_scope.as_ref().map(|_| &account_bytes_from_tor),
+		)
+		.await;
+		let usage_result = if let Some((authentication, scope)) = &account_scope {
+			record_account_bytes(
+				authentication.accounts.clone(),
+				scope.identity,
+				scope.period_start,
+				account_bytes_to_tor.load(Ordering::Relaxed),
+				account_bytes_from_tor.load(Ordering::Relaxed),
+			)
+			.await
+		} else {
+			Ok(())
+		};
+		match copy_result {
 			Ok(bytes) => bytes,
 			Err(error) if error.kind() == io::ErrorKind::TimedOut => {
 				observation.finish(200, "idle_timeout");
 				self.circuit_metrics.idle_timeouts.fetch_add(1, Ordering::Relaxed);
+				if let Err(usage_error) = usage_result {
+					eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
+					return Err(usage_error);
+				}
 				return Err(error.into());
 			}
 			Err(error) => {
 				observation.finish(200, "stream");
+				if let Err(usage_error) = usage_result {
+					eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
+					return Err(usage_error);
+				}
 				return Err(error.into());
 			}
 		};
+		if let Err(error) = usage_result {
+			eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
+			return Err(error);
+		}
 		observation.finish(200, "none");
 		Ok(()) //for now
 	}
@@ -2392,6 +3348,14 @@ fn proxy_server_configuration(
 //#[tokio::main]
 fn main() -> Result<()> {
 	let config = TorClientConfig::default();
+	let public_ingress = match configured_public_ingress() {
+		Ok(configuration) => configuration,
+		Err(error) => {
+			eprintln!("{error}");
+			process::exit(1);
+		}
+	};
+	let authentication = public_ingress.authentication();
 	let bridge_drain_config = match BridgeTaskDrainConfig::from_environment() {
 		Ok(configuration) => configuration,
 		Err(error) => {
@@ -2421,6 +3385,7 @@ fn main() -> Result<()> {
 		token_store.clone(),
 		metrics.clone(),
 		bridge_drain_config,
+		public_ingress,
 	);
 	
 	let server_configuration = match proxy_server_configuration(bridge_drain_config) {
@@ -2441,6 +3406,7 @@ fn main() -> Result<()> {
 		request_counter: 0.into(), 
 		cache: token_store.clone(),
 		metrics,
+		authentication,
 		//isolation_manager: IsolationHelper::new() ### Error, no constructors for traits
 		tor_client: tor_client.clone()
 	})
@@ -2461,11 +3427,18 @@ mod tests {
 		copy_one_direction,
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
 		proxy_server_configuration, render_prometheus_metrics, request_cache_eligible, resolve_isolation,
-		serve_prometheus_connection, take_isolation_request, CircuitBreaker, CircuitMetrics,
-		BridgeShutdown, BridgeTaskDrainConfig, BridgeTaskKind, BridgeTaskRegistry, ConnectFailure,
-		IsolationRequest, IsolationStore, PUBLIC_PROXY_ADDR,
+		serve_prometheus_connection, strip_ingress_headers, take_isolation_request,
+		AccountRequestScope, AuthenticatedDownstreamStore, AuthenticatedRequestContext,
+		BridgeIdentityRegistry, BridgeShutdown, BridgeTaskDrainConfig, BridgeTaskKind,
+		BridgeTaskRegistry, CircuitBreaker, CircuitMetrics, ConnectFailure, IsolationRequest,
+		IsolationStore, TenantIsolationHasher, PUBLIC_PROXY_ADDR,
 		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_MARGIN_SECONDS,
 	};
+	use super::account_management::{
+		AccountLimits, AccountManager, ApiKeyHasher, CertificateFingerprint, IngressIdentity,
+		PlanCode, UnixTimestamp,
+	};
+	use base64::{Engine as _, engine::general_purpose::STANDARD};
 	use pingora::prelude::{RequestHeader, ResponseHeader};
 	use pingora::services::background::BackgroundService;
 	use std::sync::{
@@ -2477,6 +3450,7 @@ mod tests {
 		task::{Context, Poll},
 	};
 	use std::time::Instant as StdInstant;
+	use zeroize::Zeroizing;
 	use tokio::{
 		io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 		runtime::Runtime,
@@ -2582,6 +3556,43 @@ mod tests {
 			.insert_header(http::header::CACHE_CONTROL, cache_control)
 			.unwrap();
 		response
+	}
+
+	fn provision_test_identity(
+		manager: &AccountManager,
+		email: &str,
+		fingerprint_byte: u8,
+	) -> IngressIdentity {
+		let now = UnixTimestamp::new(100).unwrap();
+		let account = manager
+			.create_account(
+				email,
+				None,
+				&PlanCode::new("test").unwrap(),
+				AccountLimits::new(100, 100, 8, None, None).unwrap(),
+				now,
+			)
+			.unwrap();
+		let workspace = manager
+			.create_workspace(account.id(), "default", now)
+			.unwrap();
+		let api_key = manager
+			.issue_api_key(account.id(), workspace.id(), "test", now)
+			.unwrap();
+		let fingerprint = CertificateFingerprint::from_sha256([fingerprint_byte; 32]);
+		manager
+			.register_device_credential(
+				account.id(),
+				workspace.id(),
+				&fingerprint,
+				"test device",
+				now,
+			)
+			.unwrap();
+		let encoded = STANDARD.encode(format!("{}:", api_key.secret().expose_secret()));
+		manager
+			.authenticate_ingress(&format!("Basic {encoded}"), &fingerprint)
+			.unwrap()
 	}
 
 	#[test]
@@ -2827,10 +3838,50 @@ mod tests {
 	}
 
 	#[test]
+	fn proxy_authorization_is_parsed_but_always_redacted() {
+		let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic c2Vuc2l0aXZlOg==\r\n\r\n";
+		let parsed = parse_proxy_request(request).unwrap().unwrap();
+		assert_eq!(
+			parsed.proxy_authorization.as_deref().map(String::as_str),
+			Some("Basic c2Vuc2l0aXZlOg=="),
+		);
+		let debug = format!("{parsed:?}");
+		assert!(debug.contains("[redacted]"));
+		assert!(!debug.contains("c2Vuc2l0aXZlOg"));
+
+		let duplicate = b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic b25lOg==\r\nProxy-Authorization: Basic dHdvOg==\r\n\r\n";
+		assert!(parse_proxy_request(duplicate).is_err());
+	}
+
+	#[test]
+	fn authenticated_ingress_headers_are_removed_before_pingora() {
+		let request = b"POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\nProxy-Authorization: Basic c2Vuc2l0aXZlOg==\r\nX-Proxy-Isolation: profile-1\r\nX-Proxy-Isolation-Mode: session\r\nX-Proxy-Authenticated-Lease: reserved-token\r\n\r\nbody";
+		let parsed = parse_proxy_request(request).unwrap().unwrap();
+		let sanitized = strip_ingress_headers(request, parsed.header_len).unwrap();
+		let sanitized = String::from_utf8(sanitized).unwrap();
+
+		assert!(sanitized.starts_with(
+			"POST http://example.com/upload HTTP/1.1\r\n"
+		));
+		assert!(sanitized.contains("Host: example.com\r\n"));
+		assert!(sanitized.contains("Content-Length: 4\r\n"));
+		assert!(sanitized.ends_with("\r\n\r\nbody"));
+		assert!(!sanitized.to_ascii_lowercase().contains("proxy-authorization"));
+		assert!(!sanitized.contains("X-Proxy-Isolation"));
+		assert!(!sanitized.contains("X-Proxy-Authenticated-Lease"));
+	}
+
+	#[test]
 	fn isolation_headers_are_removed_before_origin_forwarding() {
 		let mut request = cache_request("GET", "http://example.com/item", "example.com");
 		request.insert_header("X-Proxy-Isolation", "profile-1").unwrap();
 		request.insert_header("X-Proxy-Isolation-Mode", "session").unwrap();
+		request
+			.insert_header("Proxy-Authorization", "Basic c2Vuc2l0aXZlOg==")
+			.unwrap();
+		request
+			.insert_header("X-Proxy-Authenticated-Lease", "reserved-token")
+			.unwrap();
 
 		let isolation = take_isolation_request(&mut request).unwrap();
 
@@ -2838,6 +3889,63 @@ mod tests {
 		assert!(!isolation.strict);
 		assert!(!request.headers.contains_key("X-Proxy-Isolation"));
 		assert!(!request.headers.contains_key("X-Proxy-Isolation-Mode"));
+		assert!(!request.headers.contains_key("Proxy-Authorization"));
+		assert!(!request.headers.contains_key("X-Proxy-Authenticated-Lease"));
+	}
+
+	#[test]
+	fn authenticated_identity_scopes_isolation_and_opaque_handoffs() {
+		let manager = AccountManager::open_in_memory(
+			ApiKeyHasher::from_key(Zeroizing::new([0x42; blake3::KEY_LEN])),
+			8,
+		)
+		.unwrap();
+		let first = provision_test_identity(&manager, "first-scope@example.com", 0x31);
+		let second = provision_test_identity(&manager, "second-scope@example.com", 0x32);
+		let hasher = TenantIsolationHasher::new().unwrap();
+		let request = || IsolationRequest {
+			identity: Some("browser".to_owned()),
+			strict: false,
+		};
+		let first_key = hasher.resolve(first, "example.com:443", request());
+		let first_again = hasher.resolve(first, "example.com:443", request());
+		let other_account = hasher.resolve(second, "example.com:443", request());
+		let other_destination = hasher.resolve(first, "other.example:443", request());
+		assert_eq!(first_key.identity, first_again.identity);
+		assert_ne!(first_key.identity, other_account.identity);
+		assert_ne!(first_key.identity, other_destination.identity);
+		assert_eq!(first_key.identity.len(), 64);
+
+		let period_start = UnixTimestamp::new(1_700_000_000).unwrap();
+		let scope = AccountRequestScope {
+			identity: first,
+			period_start,
+		};
+		let downstream_store = Arc::new(AuthenticatedDownstreamStore::new(1));
+		let address = "127.0.0.1:32000".parse().unwrap();
+		let guard = downstream_store
+			.register(
+				address,
+				AuthenticatedRequestContext {
+					scope,
+					isolation: request(),
+				},
+			)
+			.unwrap();
+		assert_eq!(
+			downstream_store.context(&address).unwrap().scope,
+			scope,
+		);
+		drop(guard);
+		assert!(downstream_store.context(&address).is_none());
+
+		let bridge_registry = Arc::new(BridgeIdentityRegistry::new(1));
+		let lease = bridge_registry.issue(scope).unwrap();
+		assert_eq!(bridge_registry.resolve(lease.token()), Some(scope));
+		assert!(!lease.token().contains(&format!("{:?}", first.account_id())));
+		let token = lease.token().to_owned();
+		drop(lease);
+		assert!(bridge_registry.resolve(&token).is_none());
 	}
 
 	#[test]
@@ -2948,7 +4056,7 @@ mod tests {
 			let (writer, flushed, flush_count) = FlushGatedWriter::new();
 			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
 			let copying = tokio::spawn(async move {
-				copy_one_direction(bridge_reader, writer, activity, None).await
+				copy_one_direction(bridge_reader, writer, activity, None, None).await
 			});
 
 			client.write_all(b"request").await.unwrap();
@@ -2980,6 +4088,7 @@ mod tests {
 				tokio::io::sink(),
 				activity,
 				None,
+				None,
 			).await.unwrap();
 			assert_eq!(bytes, 0);
 
@@ -2993,6 +4102,7 @@ mod tests {
 					ClosedStreamShutdownWriter { kind },
 					activity,
 					None,
+					None,
 				).await.unwrap();
 				assert_eq!(bytes, 0);
 			}
@@ -3002,6 +4112,7 @@ mod tests {
 				ReadError { kind: std::io::ErrorKind::ConnectionReset },
 				tokio::io::sink(),
 				activity,
+				None,
 				None,
 			).await.unwrap_err();
 			assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);

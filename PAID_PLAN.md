@@ -14,34 +14,34 @@ Only **account/billing metadata** needs persistence — a completely separate, l
 ## 2. Code Changes Required
 
 ### 2.1 Local persistent storage (account/billing only)
-- [ ] Add **SQLite** via `rusqlite` or `sqlx` (sqlite feature) — single file, no external service needed at this scale.
-- [ ] Schema (3 tables):
+- [x] Add **SQLite** via `rusqlite` — single owner-only file, no external service needed at this scale.
+- [x] Add the account schema (expanded to include workspaces, limits, and device credentials):
   ```sql
   accounts(id, email, stripe_customer_id, plan, active, created_at)
   api_keys(id, account_id, key_hash, active, created_at, revoked_at)
   usage(account_id, period_start, bytes_used, requests_used)
   ```
-- [ ] Never store raw API keys — hash with `blake3` or `sha256`, compare hashes on lookup.
+- [x] Never store raw API keys — keyed BLAKE3 digests are stored and compared in constant time.
 - [ ] Encrypt the SQLite file at rest via **SQLCipher**, or rely on full-disk encryption (LUKS) on the VPS.
 - [ ] Add a nightly cron job to copy the encrypted DB file off-box (e.g. to Backblaze B2 or a second small VPS) — this is the actual failure point local storage introduces, not the "local vs cloud" choice itself.
 
 ### 2.2 Auth layer
-- [ ] Support **HTTP Basic Auth on the CONNECT request** (`Proxy-Authorization: Basic base64(key:)`) — zero-config for customers using standard proxy clients.
-- [ ] Add `extract_proxy_auth_key()` helper to parse the header.
-- [ ] Add `account_id: Option<AccountId>` field to `RequestCtx`.
-- [ ] Enforce auth inside `request_filter`, before assigning `ctx.id`:
+- [x] Support **HTTP Basic Auth on the CONNECT request** (`Proxy-Authorization: Basic base64(key:)`) — zero-config for customers using standard proxy clients.
+- [x] Add a bounded `extract_proxy_auth_api_key()` helper to parse the header.
+- [x] Add `account_id: Option<AccountId>` and the redacted ingress identity to `RequestCtx`.
+- [x] Enforce auth at the mTLS ingress before assigning work to `RequestCtx`:
   - Reject with `407 Proxy Authentication Required` if key missing/invalid.
   - Reject with `403` if account inactive/suspended.
-- [ ] Consider keying `IsolationToken` per **(account, host)** pair instead of just per-host, so different customers never share a circuit identity for the same destination.
+- [x] Key session isolation and Pingora pooling by **(account, workspace, canonical destination, optional sub-identity)**.
 
 ### 2.3 Rate limiting
-- [ ] In-process token-bucket limiting via the `governor` crate (sufficient under ~10–20 customers — skip Redis entirely at this scale).
-- [ ] Limit both requests/sec and concurrent circuits per account.
-- [ ] Return `429` when exceeded.
+- [x] In-process GCRA limiting via the `governor` crate (sufficient under ~10–20 customers — skip Redis entirely at this scale).
+- [x] Limit both requests/sec and concurrent tunnels per account.
+- [x] Return `429` when exceeded.
 
 ### 2.4 Usage metering (required for billing)
-- [ ] Replace `tokio::io::copy_bidirectional` in `Bridge::handle_connect` with a version that counts bytes both directions (split into two `tokio::io::copy` calls run with `tokio::try_join!`).
-- [ ] Write `(account_id, bytes_in + bytes_out)` to the `usage` table after each connection closes.
+- [x] Use the flush-aware bidirectional bridge copy to count bytes in both directions.
+- [x] Aggregate request and directional byte usage by account/workspace/period after each Tor transport closes.
 - [ ] Add a scheduled job (hourly/nightly) to push usage totals to Stripe's metered billing `UsageRecord` API.
 
 ### 2.5 Billing (Stripe)
@@ -55,7 +55,7 @@ Only **account/billing metadata** needs persistence — a completely separate, l
 - [ ] Can be a thin wrapper around Stripe Customer Portal + a few SQLite queries.
 
 ### 2.7 Ops / hardening
-- [ ] Put the public listener behind TLS (Caddy/nginx reverse proxy, or Pingora's native TLS listener) — currently plain `127.0.0.1:8080`.
+- [x] Add a native Rustls TLS 1.3 production listener with required mTLS and API-key authorization; retain plaintext only for loopback development mode.
 - [ ] systemd unit (or Docker + supervisor) for auto-restart of both the Pingora service and the Tor bridge.
 - [ ] Alerting on `TorClient::create_bootstrapped` failures — this takes down the whole service if it fails silently.
 - [ ] Document logging policy explicitly: log account/timestamp/destination-host/bytes for billing & abuse investigation; do **not** log full request paths/URLs — this is core to the privacy pitch.

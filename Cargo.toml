@@ -7,12 +7,23 @@ edition = "2024"
 anyhow = "1.0.102"
 arti-client = "0.42.0"
 async-trait = "0.1.89"
+base64 = "0.22.1"
+blake3 = { version = "1.8.5", features = ["zeroize"] }
+getrandom = "0.4.2"
+governor = { version = "0.10.4", default-features = false, features = ["quanta", "std"] }
 http = "1.4.0"
 httparse = "1.10.1"
 pingora = { version = "0.8.0", features = ["proxy", "cache"] }
 pingora-memory-cache = "0.8.0"
+rusqlite = "0.39.0"
 rustls = { version = "0.23.35", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = ["std"] }
+sha2 = "0.10.9"
+subtle = "2.6.1"
 tokio = "1.52.3"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tor-rtcompat = "0.42.0"
+zeroize = "1.8.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
