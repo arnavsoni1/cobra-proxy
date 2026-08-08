@@ -34,10 +34,11 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 use std::{
-	collections::HashMap,
+	collections::{BTreeMap, HashMap},
 	fmt,
 	future::Future,
 	hash::{Hash, Hasher},
+	num::NonZeroU64,
 	process,
 	net::{IpAddr, SocketAddr},
 	sync::{
@@ -99,6 +100,9 @@ const CIRCUIT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10); // tune later
 const TUNNEL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(45);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const ACCOUNT_USAGE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const ACCOUNT_USAGE_CHECKPOINT_BYTES: u64 = 1024 * 1024;
+const SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV: &str = "PROXY_SINGLE_TIER_PERIOD_BYTE_LIMIT";
 const DEFAULT_BRIDGE_TASK_DRAIN_SECONDS: u64 = 30;
 const DEFAULT_BRIDGE_TASK_FORCE_STOP_SECONDS: u64 = 5;
 const MAX_BRIDGE_TASK_SHUTDOWN_SECONDS: u64 = 60 * 60;
@@ -313,6 +317,362 @@ struct AccountRequestScope {
 	period_start: UnixTimestamp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SingleTierPolicy {
+	period_byte_limit: NonZeroU64,
+}
+
+impl SingleTierPolicy {
+	fn from_environment() -> anyhow::Result<Self> {
+		let value = match std::env::var(SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV) {
+			Ok(value) => value,
+			Err(std::env::VarError::NotPresent) => {
+				anyhow::bail!(
+					"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} is required in production mode"
+				);
+			}
+			Err(std::env::VarError::NotUnicode(_)) => {
+				anyhow::bail!(
+					"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} must be valid UTF-8"
+				);
+			}
+		};
+		Self::parse(Some(&value))
+	}
+
+	fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+		let value = value
+			.ok_or_else(|| anyhow::anyhow!(
+				"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} is required in production mode"
+			))?
+			.trim();
+		let parsed = value.parse::<u64>().map_err(|_| {
+			anyhow::anyhow!(
+				"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} must be a positive integer number of bytes"
+			)
+		})?;
+		let period_byte_limit = NonZeroU64::new(parsed).ok_or_else(|| {
+			anyhow::anyhow!(
+				"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} must be a positive integer number of bytes"
+			)
+		})?;
+		if parsed > i64::MAX as u64 {
+			anyhow::bail!(
+				"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} exceeds the account database counter range"
+			);
+		}
+		Ok(Self { period_byte_limit })
+	}
+}
+
+#[derive(Debug)]
+enum CustomerDataAdmissionError {
+	LimitReached { limit: u64 },
+	TierConfigurationMismatch {
+		configured_limit: u64,
+		stored_limit: Option<u64>,
+	},
+	StateCapacityReached,
+	StatePoisoned,
+	CounterOverflow,
+	Storage(account_management::AccountManagementError),
+}
+
+impl fmt::Display for CustomerDataAdmissionError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::LimitReached { limit } => {
+				write!(formatter, "customer period data limit {limit} bytes reached")
+			}
+			Self::TierConfigurationMismatch {
+				configured_limit,
+				stored_limit,
+			} => write!(
+				formatter,
+				"account data limit {stored_limit:?} does not match the single-tier limit {configured_limit}"
+			),
+			Self::StateCapacityReached => {
+				formatter.write_str("customer data-limit state capacity reached")
+			}
+			Self::StatePoisoned => formatter.write_str("customer data-limit state is unavailable"),
+			Self::CounterOverflow => formatter.write_str("customer data usage counter overflowed"),
+			Self::Storage(_) => formatter.write_str("customer data usage storage is unavailable"),
+		}
+	}
+}
+
+impl std::error::Error for CustomerDataAdmissionError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::Storage(source) => Some(source),
+			_ => None,
+		}
+	}
+}
+
+impl From<account_management::AccountManagementError> for CustomerDataAdmissionError {
+	fn from(source: account_management::AccountManagementError) -> Self {
+		Self::Storage(source)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CustomerDataAllowance {
+	bytes: usize,
+	exhausted: bool,
+}
+
+#[derive(Debug)]
+struct CustomerPeriodUsage {
+	used_bytes: AtomicU64,
+	last_used: AtomicU64,
+}
+
+impl CustomerPeriodUsage {
+	fn new(used_bytes: u64, sequence: u64) -> Self {
+		Self {
+			used_bytes: AtomicU64::new(used_bytes),
+			last_used: AtomicU64::new(sequence),
+		}
+	}
+
+	fn ensure_available(&self, limit: u64) -> Result<(), CustomerDataAdmissionError> {
+		if self.used_bytes.load(Ordering::Acquire) >= limit {
+			return Err(CustomerDataAdmissionError::LimitReached { limit });
+		}
+		Ok(())
+	}
+
+	fn allow(
+		&self,
+		requested: usize,
+		limit: u64,
+	) -> Result<CustomerDataAllowance, CustomerDataAdmissionError> {
+		let requested = u64::try_from(requested)
+			.map_err(|_| CustomerDataAdmissionError::CounterOverflow)?;
+		loop {
+			let current = self.used_bytes.load(Ordering::Acquire);
+			if current >= limit {
+				return Err(CustomerDataAdmissionError::LimitReached { limit });
+			}
+			let remaining = limit - current;
+			let allowed = requested.min(remaining);
+			let projected = current
+				.checked_add(allowed)
+				.ok_or(CustomerDataAdmissionError::CounterOverflow)?;
+			match self.used_bytes.compare_exchange_weak(
+				current,
+				projected,
+				Ordering::AcqRel,
+				Ordering::Acquire,
+			) {
+				Ok(_) => {
+					return Ok(CustomerDataAllowance {
+						bytes: usize::try_from(allowed)
+							.map_err(|_| CustomerDataAdmissionError::CounterOverflow)?,
+						exhausted: projected == limit,
+					});
+				}
+				Err(_) => continue,
+			}
+		}
+	}
+}
+
+#[derive(Debug)]
+struct CustomerDataLimiter {
+	policy: SingleTierPolicy,
+	states: Mutex<BTreeMap<(AccountId, UnixTimestamp), Arc<CustomerPeriodUsage>>>,
+	max_cached_periods: usize,
+	sequence: AtomicU64,
+}
+
+impl CustomerDataLimiter {
+	fn new(policy: SingleTierPolicy, max_cached_periods: usize) -> anyhow::Result<Self> {
+		if max_cached_periods == 0 {
+			anyhow::bail!("customer data-limit cache capacity must be positive");
+		}
+		Ok(Self {
+			policy,
+			states: Mutex::new(BTreeMap::new()),
+			max_cached_periods,
+			sequence: AtomicU64::new(1),
+		})
+	}
+
+	fn ensure_available(
+		&self,
+		accounts: &AccountManager,
+		identity: IngressIdentity,
+		period_start: UnixTimestamp,
+	) -> Result<(), CustomerDataAdmissionError> {
+		self.state_for(accounts, identity, period_start)?
+			.ensure_available(self.policy.period_byte_limit.get())
+	}
+
+	fn open_session(
+		&self,
+		accounts: Arc<AccountManager>,
+		identity: IngressIdentity,
+		period_start: UnixTimestamp,
+	) -> Result<CustomerDataSession, CustomerDataAdmissionError> {
+		let state = self.state_for(&accounts, identity, period_start)?;
+		state.ensure_available(self.policy.period_byte_limit.get())?;
+		Ok(CustomerDataSession {
+			accounts,
+			identity,
+			period_start,
+			limit: self.policy.period_byte_limit.get(),
+			state,
+			bytes_to_tor: AtomicU64::new(0),
+			bytes_from_tor: AtomicU64::new(0),
+			persisted_to_tor: AtomicU64::new(0),
+			persisted_from_tor: AtomicU64::new(0),
+		})
+	}
+
+	fn state_for(
+		&self,
+		accounts: &AccountManager,
+		identity: IngressIdentity,
+		period_start: UnixTimestamp,
+	) -> Result<Arc<CustomerPeriodUsage>, CustomerDataAdmissionError> {
+		let configured_limit = self.policy.period_byte_limit.get();
+		let stored_limit = identity
+			.limits()
+			.period_byte_limit()
+			.map(NonZeroU64::get);
+		if stored_limit != Some(configured_limit) {
+			return Err(CustomerDataAdmissionError::TierConfigurationMismatch {
+				configured_limit,
+				stored_limit,
+			});
+		}
+
+		let key = (identity.account_id(), period_start);
+		let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+		let mut states = self
+			.states
+			.lock()
+			.map_err(|_| CustomerDataAdmissionError::StatePoisoned)?;
+		if let Some(state) = states.get(&key) {
+			state.last_used.store(sequence, Ordering::Relaxed);
+			return Ok(Arc::clone(state));
+		}
+
+		if states.len() >= self.max_cached_periods {
+			let eviction_key = states
+				.iter()
+				.filter(|(_, state)| Arc::strong_count(state) == 1)
+				.min_by_key(|(_, state)| state.last_used.load(Ordering::Relaxed))
+				.map(|(key, _)| *key);
+			if let Some(eviction_key) = eviction_key {
+				states.remove(&eviction_key);
+			}
+		}
+		if states.len() >= self.max_cached_periods {
+			return Err(CustomerDataAdmissionError::StateCapacityReached);
+		}
+
+		let persisted_bytes = accounts
+			.list_workspaces(identity.account_id())?
+			.into_iter()
+			.try_fold(0_u64, |total, workspace| {
+				let snapshot = accounts.usage_for_scope(
+					identity.account_id(),
+					workspace.id(),
+					period_start,
+				)?;
+				let bytes = snapshot.total_bytes()?;
+				total
+					.checked_add(bytes)
+					.ok_or(account_management::AccountManagementError::CounterOverflow)
+			})?;
+		if persisted_bytes >= configured_limit {
+			return Err(CustomerDataAdmissionError::LimitReached {
+				limit: configured_limit,
+			});
+		}
+		let state = Arc::new(CustomerPeriodUsage::new(persisted_bytes, sequence));
+		states.insert(key, Arc::clone(&state));
+		Ok(state)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CustomerDataDirection {
+	ToTor,
+	FromTor,
+}
+
+#[derive(Debug)]
+struct CustomerDataSession {
+	accounts: Arc<AccountManager>,
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+	limit: u64,
+	state: Arc<CustomerPeriodUsage>,
+	bytes_to_tor: AtomicU64,
+	bytes_from_tor: AtomicU64,
+	persisted_to_tor: AtomicU64,
+	persisted_from_tor: AtomicU64,
+}
+
+impl CustomerDataSession {
+	fn allow(
+		&self,
+		requested: usize,
+	) -> Result<CustomerDataAllowance, CustomerDataAdmissionError> {
+		self.state.allow(requested, self.limit)
+	}
+
+	fn record_transferred(&self, direction: CustomerDataDirection, bytes: u64) {
+		let counter = match direction {
+			CustomerDataDirection::ToTor => &self.bytes_to_tor,
+			CustomerDataDirection::FromTor => &self.bytes_from_tor,
+		};
+		counter.fetch_add(bytes, Ordering::Relaxed);
+	}
+
+	fn checkpoint_due(&self) -> bool {
+		let bytes_to_tor = self.bytes_to_tor.load(Ordering::Acquire);
+		let bytes_from_tor = self.bytes_from_tor.load(Ordering::Acquire);
+		let persisted_to_tor = self.persisted_to_tor.load(Ordering::Acquire);
+		let persisted_from_tor = self.persisted_from_tor.load(Ordering::Acquire);
+		let pending_to_tor = bytes_to_tor.saturating_sub(persisted_to_tor);
+		let pending_from_tor = bytes_from_tor.saturating_sub(persisted_from_tor);
+		pending_to_tor.saturating_add(pending_from_tor) >= ACCOUNT_USAGE_CHECKPOINT_BYTES
+	}
+
+	async fn checkpoint(&self) -> anyhow::Result<()> {
+		let bytes_to_tor = self.bytes_to_tor.load(Ordering::Acquire);
+		let bytes_from_tor = self.bytes_from_tor.load(Ordering::Acquire);
+		let persisted_to_tor = self.persisted_to_tor.load(Ordering::Acquire);
+		let persisted_from_tor = self.persisted_from_tor.load(Ordering::Acquire);
+		let delta_to_tor = bytes_to_tor
+			.checked_sub(persisted_to_tor)
+			.ok_or_else(|| anyhow::anyhow!("account upload checkpoint moved backwards"))?;
+		let delta_from_tor = bytes_from_tor
+			.checked_sub(persisted_from_tor)
+			.ok_or_else(|| anyhow::anyhow!("account download checkpoint moved backwards"))?;
+		if delta_to_tor == 0 && delta_from_tor == 0 {
+			return Ok(());
+		}
+		record_account_bytes(
+			self.accounts.clone(),
+			self.identity,
+			self.period_start,
+			delta_to_tor,
+			delta_from_tor,
+		)
+		.await?;
+		self.persisted_to_tor.store(bytes_to_tor, Ordering::Release);
+		self.persisted_from_tor
+			.store(bytes_from_tor, Ordering::Release);
+		Ok(())
+	}
+}
+
 struct DownstreamContextEntry {
 	generation: u64,
 	context: AuthenticatedRequestContext,
@@ -471,6 +831,7 @@ impl Drop for BridgeIdentityLease {
 #[derive(Clone)]
 struct AuthenticatedIngressRuntime {
 	accounts: Arc<AccountManager>,
+	data_limiter: Arc<CustomerDataLimiter>,
 	downstream_contexts: Arc<AuthenticatedDownstreamStore>,
 	bridge_identities: Arc<BridgeIdentityRegistry>,
 	isolation_hasher: TenantIsolationHasher,
@@ -528,6 +889,11 @@ impl PublicIngressRuntime {
 fn configured_public_ingress() -> anyhow::Result<PublicIngressRuntime> {
 	match RuntimeIngressConfig::from_environment()? {
 		RuntimeIngressConfig::Development { listen_addr } => {
+			if std::env::var_os(SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV).is_some() {
+				anyhow::bail!(
+					"{SINGLE_TIER_PERIOD_BYTE_LIMIT_ENV} requires PROXY_INGRESS_MODE=production"
+				);
+			}
 			Ok(PublicIngressRuntime::Development { listen_addr })
 		}
 		RuntimeIngressConfig::Production {
@@ -537,6 +903,7 @@ fn configured_public_ingress() -> anyhow::Result<PublicIngressRuntime> {
 			max_cached_accounts,
 			usage_period,
 		} => {
+			let single_tier_policy = SingleTierPolicy::from_environment()?;
 			let server_config = load_server_config(&tls)?;
 			let api_key_hasher = ApiKeyHasher::from_key_file(&api_key_hash_key_file)?;
 			let accounts = Arc::new(AccountManager::open(
@@ -544,6 +911,9 @@ fn configured_public_ingress() -> anyhow::Result<PublicIngressRuntime> {
 				api_key_hasher,
 				max_cached_accounts,
 			)?);
+			let max_cached_usage_periods = max_cached_accounts
+				.checked_mul(2)
+				.ok_or_else(|| anyhow::anyhow!("customer data-limit cache capacity overflow"))?;
 			let bridge_identity_capacity = tls
 				.capacity
 				.max_client_connections
@@ -551,6 +921,10 @@ fn configured_public_ingress() -> anyhow::Result<PublicIngressRuntime> {
 				.ok_or_else(|| anyhow::anyhow!("bridge identity capacity overflow"))?;
 			let authentication = AuthenticatedIngressRuntime {
 				accounts,
+				data_limiter: Arc::new(CustomerDataLimiter::new(
+					single_tier_policy,
+					max_cached_usage_periods,
+				)?),
 				downstream_contexts: Arc::new(AuthenticatedDownstreamStore::new(
 					tls.capacity.max_client_connections,
 				)),
@@ -1264,6 +1638,8 @@ struct CircuitMetrics {
 	breaker_rejections: AtomicUsize,
 	bytes_to_tor: AtomicU64,
 	bytes_from_tor: AtomicU64,
+	customer_data_limit_rejections: AtomicU64,
+	account_usage_checkpoint_failures: AtomicU64,
 	request_counts: Mutex<HashMap<(String, u16), u64>>,
 	arti_failures: Mutex<HashMap<&'static str, u64>>,
 	request_latency: LatencyHistogram,
@@ -1716,6 +2092,8 @@ fn render_prometheus_metrics(
 	metric!("proxy_circuit_breaker_rejections_total", "Requests rejected by an open circuit breaker.", "counter", metrics.breaker_rejections.load(Ordering::Relaxed));
 	metric!("proxy_bytes_to_tor_total", "Payload bytes sent toward Tor.", "counter", metrics.bytes_to_tor.load(Ordering::Relaxed));
 	metric!("proxy_bytes_from_tor_total", "Payload bytes received from Tor.", "counter", metrics.bytes_from_tor.load(Ordering::Relaxed));
+	metric!("proxy_customer_data_limit_rejections_total", "Requests or active tunnels stopped by the account-wide period data limit.", "counter", metrics.customer_data_limit_rejections.load(Ordering::Relaxed));
+	metric!("proxy_account_usage_checkpoint_failures_total", "Active-tunnel usage checkpoints that failed closed.", "counter", metrics.account_usage_checkpoint_failures.load(Ordering::Relaxed));
 	metric!("proxy_cache_hits_total", "Fresh shared-cache hits.", "counter", metrics.cache_hits.load(Ordering::Relaxed));
 	metric!("proxy_cache_misses_total", "Shared-cache misses.", "counter", metrics.cache_misses.load(Ordering::Relaxed));
 	metric!("proxy_cache_stale_hits_total", "Stale shared-cache hits.", "counter", metrics.cache_stale_hits.load(Ordering::Relaxed));
@@ -1886,11 +2264,80 @@ where
 }
 
 async fn copy_one_direction<R, W>(
+	reader: R,
+	writer: W,
+	activity: watch::Sender<u64>,
+	byte_counter: Option<&AtomicU64>,
+	secondary_byte_counter: Option<&AtomicU64>,
+) -> io::Result<u64>
+where
+	R: tokio::io::AsyncRead + Unpin,
+	W: tokio::io::AsyncWrite + Unpin,
+{
+	copy_one_direction_with_customer_data(
+		reader,
+		writer,
+		activity,
+		byte_counter,
+		secondary_byte_counter,
+		None,
+		CustomerDataDirection::ToTor,
+	)
+	.await
+}
+
+#[derive(Debug)]
+struct CustomerDataLimitReached;
+
+impl fmt::Display for CustomerDataLimitReached {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("customer period data limit reached")
+	}
+}
+
+impl std::error::Error for CustomerDataLimitReached {}
+
+#[derive(Debug)]
+struct AccountUsageCheckpointFailed;
+
+impl fmt::Display for AccountUsageCheckpointFailed {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("account usage checkpoint failed")
+	}
+}
+
+impl std::error::Error for AccountUsageCheckpointFailed {}
+
+fn customer_data_limit_error() -> io::Error {
+	io::Error::new(io::ErrorKind::PermissionDenied, CustomerDataLimitReached)
+}
+
+fn account_usage_checkpoint_error() -> io::Error {
+	io::Error::other(AccountUsageCheckpointFailed)
+}
+
+fn is_customer_data_limit_error(error: &io::Error) -> bool {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<CustomerDataLimitReached>())
+		.is_some()
+}
+
+fn is_account_usage_checkpoint_error(error: &io::Error) -> bool {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<AccountUsageCheckpointFailed>())
+		.is_some()
+}
+
+async fn copy_one_direction_with_customer_data<R, W>(
 	mut reader: R,
 	mut writer: W,
 	activity: watch::Sender<u64>,
 	byte_counter: Option<&AtomicU64>,
 	secondary_byte_counter: Option<&AtomicU64>,
+	data_session: Option<&CustomerDataSession>,
+	direction: CustomerDataDirection,
 ) -> io::Result<u64>
 where
 	R: tokio::io::AsyncRead + Unpin,
@@ -1913,18 +2360,43 @@ where
 			shutdown_copy_writer(&mut writer).await?;
 			return Ok(bytes_copied);
 		}
-		writer.write_all(&buffer[..read]).await?;
+		let allowance = match data_session {
+			Some(data_session) => match data_session.allow(read) {
+				Ok(allowance) => allowance,
+				Err(CustomerDataAdmissionError::LimitReached { .. }) => {
+					let _ = shutdown_copy_writer(&mut writer).await;
+					return Err(customer_data_limit_error());
+				}
+				Err(_) => {
+					let _ = shutdown_copy_writer(&mut writer).await;
+					return Err(io::Error::other("customer data limiter is unavailable"));
+				}
+			},
+			None => CustomerDataAllowance {
+				bytes: read,
+				exhausted: false,
+			},
+		};
+		writer.write_all(&buffer[..allowance.bytes]).await?;
 		// Arti's DataStream buffers partial relay cells. write_all() only queues
 		// those bytes, so flush before waiting for traffic in the other direction.
 		writer.flush().await?;
-		bytes_copied = bytes_copied.saturating_add(read as u64);
+		let transferred = allowance.bytes as u64;
+		bytes_copied = bytes_copied.saturating_add(transferred);
 		if let Some(byte_counter) = byte_counter {
-			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
+			byte_counter.fetch_add(transferred, Ordering::Relaxed);
 		}
 		if let Some(byte_counter) = secondary_byte_counter {
-			byte_counter.fetch_add(read as u64, Ordering::Relaxed);
+			byte_counter.fetch_add(transferred, Ordering::Relaxed);
+		}
+		if let Some(data_session) = data_session {
+			data_session.record_transferred(direction, transferred);
 		}
 		activity.send_modify(|generation| *generation = generation.wrapping_add(1));
+		if allowance.exhausted {
+			let _ = shutdown_copy_writer(&mut writer).await;
+			return Err(customer_data_limit_error());
+		}
 	}
 }
 
@@ -2035,6 +2507,83 @@ where
 	}
 }
 
+async fn checkpoint_customer_data_session(data_session: &CustomerDataSession) -> io::Result<()> {
+	data_session.checkpoint().await.map_err(|_| account_usage_checkpoint_error())
+}
+
+async fn copy_bidirectional_with_customer_data_limit<A, B>(
+	a: &mut A,
+	b: &mut B,
+	idle_timeout: Duration,
+	bytes_a_to_b: Option<&AtomicU64>,
+	bytes_b_to_a: Option<&AtomicU64>,
+	data_session: &CustomerDataSession,
+) -> io::Result<(u64, u64)>
+where
+	A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+	let (a_reader, a_writer) = tokio::io::split(a);
+	let (b_reader, b_writer) = tokio::io::split(b);
+	let (activity, mut activity_rx) = watch::channel(0_u64);
+	let activity_reverse = activity.clone();
+	let copy = async {
+		tokio::try_join!(
+			copy_one_direction_with_customer_data(
+				a_reader,
+				b_writer,
+				activity,
+				bytes_a_to_b,
+				None,
+				Some(data_session),
+				CustomerDataDirection::ToTor,
+			),
+			copy_one_direction_with_customer_data(
+				b_reader,
+				a_writer,
+				activity_reverse,
+				bytes_b_to_a,
+				None,
+				Some(data_session),
+				CustomerDataDirection::FromTor,
+			),
+		)
+	};
+	tokio::pin!(copy);
+	let idle = tokio::time::sleep(idle_timeout);
+	tokio::pin!(idle);
+	let mut checkpoint = tokio::time::interval(ACCOUNT_USAGE_CHECKPOINT_INTERVAL);
+	checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+	checkpoint.tick().await;
+
+	loop {
+		tokio::select! {
+			result = &mut copy => {
+				checkpoint_customer_data_session(data_session).await?;
+				return result;
+			}
+			changed = activity_rx.changed() => {
+				if changed.is_err() {
+					let result = copy.await;
+					checkpoint_customer_data_session(data_session).await?;
+					return result;
+				}
+				idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+				if data_session.checkpoint_due() {
+					checkpoint_customer_data_session(data_session).await?;
+				}
+			}
+			_ = checkpoint.tick() => {
+				checkpoint_customer_data_session(data_session).await?;
+			}
+			_ = &mut idle => {
+				checkpoint_customer_data_session(data_session).await?;
+				return Err(io::Error::new(io::ErrorKind::TimedOut, "tunnel idle timeout"));
+			}
+		}
+	}
+}
+
 async fn acquire_circuit_permit<S>(
 	stream: &mut S,
 	circuit_semaphore: Arc<Semaphore>,
@@ -2071,6 +2620,12 @@ enum RuntimeAuthenticationError {
 #[derive(Debug)]
 enum RuntimeUsageAdmissionError {
 	Account(UsageAdmissionError),
+	Worker(JoinError),
+}
+
+#[derive(Debug)]
+enum RuntimeCustomerDataAdmissionError {
+	Customer(CustomerDataAdmissionError),
 	Worker(JoinError),
 }
 
@@ -2132,6 +2687,34 @@ async fn admit_account_request(
 		.map_err(RuntimeUsageAdmissionError::Worker)?
 		.map(|_| ())
 		.map_err(RuntimeUsageAdmissionError::Account)
+}
+
+async fn ensure_customer_data_available(
+	accounts: Arc<AccountManager>,
+	data_limiter: Arc<CustomerDataLimiter>,
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+) -> std::result::Result<(), RuntimeCustomerDataAdmissionError> {
+	tokio::task::spawn_blocking(move || {
+		data_limiter.ensure_available(&accounts, identity, period_start)
+	})
+	.await
+	.map_err(RuntimeCustomerDataAdmissionError::Worker)?
+	.map_err(RuntimeCustomerDataAdmissionError::Customer)
+}
+
+async fn open_customer_data_session(
+	accounts: Arc<AccountManager>,
+	data_limiter: Arc<CustomerDataLimiter>,
+	identity: IngressIdentity,
+	period_start: UnixTimestamp,
+) -> std::result::Result<CustomerDataSession, RuntimeCustomerDataAdmissionError> {
+	tokio::task::spawn_blocking(move || {
+		data_limiter.open_session(accounts, identity, period_start)
+	})
+	.await
+	.map_err(RuntimeCustomerDataAdmissionError::Worker)?
+	.map_err(RuntimeCustomerDataAdmissionError::Customer)
 }
 
 async fn record_account_bytes(
@@ -2881,6 +3464,39 @@ impl Bridge {
 					return Err(error.into());
 				}
 			};
+			match ensure_customer_data_available(
+				authentication.accounts.clone(),
+				authentication.data_limiter.clone(),
+				identity,
+				period_start,
+			)
+			.await
+			{
+				Ok(()) => {}
+				Err(RuntimeCustomerDataAdmissionError::Customer(
+					CustomerDataAdmissionError::LimitReached { .. },
+				)) => {
+					let _ = stream.write_all(QUOTA_EXCEEDED_RESPONSE).await;
+					self.circuit_metrics
+						.customer_data_limit_rejections
+						.fetch_add(1, Ordering::Relaxed);
+					self.circuit_metrics
+						.record_request(&request.method, 429, ingress_started.elapsed());
+					anyhow::bail!("customer period data limit reached");
+				}
+				Err(RuntimeCustomerDataAdmissionError::Customer(error)) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("customer data admission failed: {error}");
+				}
+				Err(RuntimeCustomerDataAdmissionError::Worker(error)) => {
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					self.circuit_metrics
+						.record_request(&request.method, 503, ingress_started.elapsed());
+					anyhow::bail!("customer data admission worker failed: {error}");
+				}
+			}
 			match admit_account_request(
 				authentication.accounts.clone(),
 				identity,
@@ -3150,6 +3766,40 @@ impl Bridge {
 		} else {
 			None
 		};
+		let customer_data_session = if let Some((authentication, scope)) = &account_scope {
+			match open_customer_data_session(
+				authentication.accounts.clone(),
+				authentication.data_limiter.clone(),
+				scope.identity,
+				scope.period_start,
+			)
+			.await
+			{
+				Ok(session) => Some(session),
+				Err(RuntimeCustomerDataAdmissionError::Customer(
+					CustomerDataAdmissionError::LimitReached { .. },
+				)) => {
+					observation.finish(429, "account_data_limit");
+					self.circuit_metrics
+						.customer_data_limit_rejections
+						.fetch_add(1, Ordering::Relaxed);
+					let _ = stream.write_all(QUOTA_EXCEEDED_RESPONSE).await;
+					anyhow::bail!("customer period data limit reached");
+				}
+				Err(RuntimeCustomerDataAdmissionError::Customer(error)) => {
+					observation.finish(503, "account_data_admission");
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					anyhow::bail!("customer data admission failed: {error}");
+				}
+				Err(RuntimeCustomerDataAdmissionError::Worker(error)) => {
+					observation.finish(503, "account_data_admission");
+					let _ = stream.write_all(SERVICE_UNAVAILABLE_RESPONSE).await;
+					anyhow::bail!("customer data admission worker failed: {error}");
+				}
+			}
+		} else {
+			None
+		};
 		let _active_tunnel_permit = match acquire_active_tunnel_permit(
 			&mut stream,
 			self.tunnel_semaphore.clone(),
@@ -3206,68 +3856,106 @@ impl Bridge {
 				anyhow::bail!("Tor connection failed with class {:?}", error.kind());
 			}
 		};
-		let account_bytes_to_tor = AtomicU64::new(0);
-		let account_bytes_from_tor = AtomicU64::new(0);
 		if !buffered_tunnel_data.is_empty() {
-			tor_stream.write_all(&buffered_tunnel_data).await?;
+			let allowance = match &customer_data_session {
+				Some(data_session) => data_session.allow(buffered_tunnel_data.len()),
+				None => Ok(CustomerDataAllowance {
+					bytes: buffered_tunnel_data.len(),
+					exhausted: false,
+				}),
+			};
+			let allowance = match allowance {
+				Ok(allowance) => allowance,
+				Err(CustomerDataAdmissionError::LimitReached { .. }) => {
+					self.circuit_metrics
+						.customer_data_limit_rejections
+						.fetch_add(1, Ordering::Relaxed);
+					observation.finish(200, "account_data_limit");
+					return Err(customer_data_limit_error().into());
+				}
+				Err(error) => return Err(error.into()),
+			};
+			tor_stream
+				.write_all(&buffered_tunnel_data[..allowance.bytes])
+				.await?;
 			// These bytes were read alongside the CONNECT header and bypass the
 			// regular copy loop, so they need their own explicit Arti flush.
 			tor_stream.flush().await?;
 			self.circuit_metrics
 				.bytes_to_tor
-				.fetch_add(buffered_tunnel_data.len() as u64, Ordering::Relaxed);
-			if account_scope.is_some() {
-				account_bytes_to_tor
-					.fetch_add(buffered_tunnel_data.len() as u64, Ordering::Relaxed);
+				.fetch_add(allowance.bytes as u64, Ordering::Relaxed);
+			if let Some(data_session) = &customer_data_session {
+				data_session.record_transferred(
+					CustomerDataDirection::ToTor,
+					allowance.bytes as u64,
+				);
+			}
+			if allowance.exhausted {
+				if let Some(data_session) = &customer_data_session
+					&& checkpoint_customer_data_session(data_session).await.is_err()
+				{
+					self.circuit_metrics
+						.account_usage_checkpoint_failures
+						.fetch_add(1, Ordering::Relaxed);
+					eprintln!("{{\"event\":\"account_usage_checkpoint_failed\"}}");
+					observation.finish(200, "usage_checkpoint");
+					return Err(account_usage_checkpoint_error().into());
+				}
+				self.circuit_metrics
+					.customer_data_limit_rejections
+					.fetch_add(1, Ordering::Relaxed);
+				observation.finish(200, "account_data_limit");
+				return Err(customer_data_limit_error().into());
 			}
 		}
 
-		let copy_result = copy_bidirectional_with_idle_timeout_and_counter_sets(
-			&mut stream,
-			&mut tor_stream,
-			TUNNEL_IDLE_TIMEOUT,
-			Some(&self.circuit_metrics.bytes_to_tor),
-			Some(&self.circuit_metrics.bytes_from_tor),
-			account_scope.as_ref().map(|_| &account_bytes_to_tor),
-			account_scope.as_ref().map(|_| &account_bytes_from_tor),
-		)
-		.await;
-		let usage_result = if let Some((authentication, scope)) = &account_scope {
-			record_account_bytes(
-				authentication.accounts.clone(),
-				scope.identity,
-				scope.period_start,
-				account_bytes_to_tor.load(Ordering::Relaxed),
-				account_bytes_from_tor.load(Ordering::Relaxed),
+		let copy_result = if let Some(data_session) = &customer_data_session {
+			copy_bidirectional_with_customer_data_limit(
+				&mut stream,
+				&mut tor_stream,
+				TUNNEL_IDLE_TIMEOUT,
+				Some(&self.circuit_metrics.bytes_to_tor),
+				Some(&self.circuit_metrics.bytes_from_tor),
+				data_session,
 			)
 			.await
 		} else {
-			Ok(())
+			copy_bidirectional_with_idle_timeout_and_counters(
+				&mut stream,
+				&mut tor_stream,
+				TUNNEL_IDLE_TIMEOUT,
+				Some(&self.circuit_metrics.bytes_to_tor),
+				Some(&self.circuit_metrics.bytes_from_tor),
+			)
+			.await
 		};
 		match copy_result {
 			Ok(bytes) => bytes,
+			Err(error) if is_customer_data_limit_error(&error) => {
+				observation.finish(200, "account_data_limit");
+				self.circuit_metrics
+					.customer_data_limit_rejections
+					.fetch_add(1, Ordering::Relaxed);
+				return Err(error.into());
+			}
+			Err(error) if is_account_usage_checkpoint_error(&error) => {
+				observation.finish(200, "usage_checkpoint");
+				self.circuit_metrics
+					.account_usage_checkpoint_failures
+					.fetch_add(1, Ordering::Relaxed);
+				eprintln!("{{\"event\":\"account_usage_checkpoint_failed\"}}");
+				return Err(error.into());
+			}
 			Err(error) if error.kind() == io::ErrorKind::TimedOut => {
 				observation.finish(200, "idle_timeout");
 				self.circuit_metrics.idle_timeouts.fetch_add(1, Ordering::Relaxed);
-				if let Err(usage_error) = usage_result {
-					eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
-					return Err(usage_error);
-				}
 				return Err(error.into());
 			}
 			Err(error) => {
 				observation.finish(200, "stream");
-				if let Err(usage_error) = usage_result {
-					eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
-					return Err(usage_error);
-				}
 				return Err(error.into());
 			}
 		};
-		if let Err(error) = usage_result {
-			eprintln!("{{\"event\":\"account_usage_write_failed\"}}");
-			return Err(error);
-		}
 		observation.finish(200, "none");
 		Ok(()) //for now
 	}
@@ -3424,19 +4112,20 @@ mod tests {
 		acquire_active_tunnel_permit, acquire_circuit_permit, canonical_cache_key_parts,
 		canonical_connect_destination_key, conservative_response_cacheable, connect_destination_allowed,
 		copy_bidirectional_with_idle_timeout, copy_bidirectional_with_idle_timeout_and_counters,
-		copy_one_direction,
+		copy_one_direction, copy_one_direction_with_customer_data,
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
 		proxy_server_configuration, render_prometheus_metrics, request_cache_eligible, resolve_isolation,
 		serve_prometheus_connection, strip_ingress_headers, take_isolation_request,
 		AccountRequestScope, AuthenticatedDownstreamStore, AuthenticatedRequestContext,
 		BridgeIdentityRegistry, BridgeShutdown, BridgeTaskDrainConfig, BridgeTaskKind,
-		BridgeTaskRegistry, CircuitBreaker, CircuitMetrics, ConnectFailure, IsolationRequest,
-		IsolationStore, TenantIsolationHasher, PUBLIC_PROXY_ADDR,
+		BridgeTaskRegistry, CircuitBreaker, CircuitMetrics, ConnectFailure,
+		CustomerDataAdmissionError, CustomerDataDirection, CustomerDataLimiter, IsolationRequest,
+		IsolationStore, SingleTierPolicy, TenantIsolationHasher, PUBLIC_PROXY_ADDR,
 		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_MARGIN_SECONDS,
 	};
 	use super::account_management::{
 		AccountLimits, AccountManager, ApiKeyHasher, CertificateFingerprint, IngressIdentity,
-		PlanCode, UnixTimestamp,
+		PlanCode, UnixTimestamp, UsageDelta,
 	};
 	use base64::{Engine as _, engine::general_purpose::STANDARD};
 	use pingora::prelude::{RequestHeader, ResponseHeader};
@@ -3593,6 +4282,263 @@ mod tests {
 		manager
 			.authenticate_ingress(&format!("Basic {encoded}"), &fingerprint)
 			.unwrap()
+	}
+
+	fn authenticate_test_identity(
+		manager: &AccountManager,
+		api_key: &super::account_management::IssuedApiKey,
+		fingerprint: &CertificateFingerprint,
+	) -> IngressIdentity {
+		let encoded = STANDARD.encode(format!("{}:", api_key.secret().expose_secret()));
+		manager
+			.authenticate_ingress(&format!("Basic {encoded}"), fingerprint)
+			.unwrap()
+	}
+
+	fn provision_limited_test_identity(
+		manager: &AccountManager,
+		email: &str,
+		fingerprint_byte: u8,
+		period_byte_limit: u64,
+	) -> IngressIdentity {
+		let now = UnixTimestamp::new(100).unwrap();
+		let account = manager
+			.create_account(
+				email,
+				None,
+				&PlanCode::new("launch").unwrap(),
+				AccountLimits::new(100, 100, 8, None, Some(period_byte_limit)).unwrap(),
+				now,
+			)
+			.unwrap();
+		let workspace = manager
+			.create_workspace(account.id(), "default", now)
+			.unwrap();
+		let api_key = manager
+			.issue_api_key(account.id(), workspace.id(), "test", now)
+			.unwrap();
+		let fingerprint = CertificateFingerprint::from_sha256([fingerprint_byte; 32]);
+		manager
+			.register_device_credential(
+				account.id(),
+				workspace.id(),
+				&fingerprint,
+				"test device",
+				now,
+			)
+			.unwrap();
+		authenticate_test_identity(manager, &api_key, &fingerprint)
+	}
+
+	#[test]
+	fn single_tier_policy_requires_a_database_sized_positive_byte_limit() {
+		let policy = SingleTierPolicy::parse(Some("10737418240")).unwrap();
+		assert_eq!(policy.period_byte_limit.get(), 10 * 1024 * 1024 * 1024);
+		assert!(SingleTierPolicy::parse(None).is_err());
+		assert!(SingleTierPolicy::parse(Some("0")).is_err());
+		assert!(SingleTierPolicy::parse(Some("ten-gigabytes")).is_err());
+		assert!(SingleTierPolicy::parse(Some("9223372036854775808")).is_err());
+	}
+
+	#[test]
+	fn customer_data_limit_is_shared_across_workspaces_and_live_sessions() {
+		let manager = Arc::new(
+			AccountManager::open_in_memory(
+				ApiKeyHasher::from_key(Zeroizing::new([0x71; blake3::KEY_LEN])),
+				8,
+			)
+			.unwrap(),
+		);
+		let now = UnixTimestamp::new(100).unwrap();
+		let period_start = UnixTimestamp::new(0).unwrap();
+		let limits = AccountLimits::new(100, 100, 8, None, Some(10)).unwrap();
+		let account = manager
+			.create_account(
+				"shared-limit@example.com",
+				None,
+				&PlanCode::new("launch").unwrap(),
+				limits,
+				now,
+			)
+			.unwrap();
+		let first_workspace = manager
+			.create_workspace(account.id(), "first", now)
+			.unwrap();
+		let second_workspace = manager
+			.create_workspace(account.id(), "second", now)
+			.unwrap();
+		let first_key = manager
+			.issue_api_key(account.id(), first_workspace.id(), "first", now)
+			.unwrap();
+		let second_key = manager
+			.issue_api_key(account.id(), second_workspace.id(), "second", now)
+			.unwrap();
+		let first_fingerprint = CertificateFingerprint::from_sha256([0x72; 32]);
+		let second_fingerprint = CertificateFingerprint::from_sha256([0x73; 32]);
+		manager
+			.register_device_credential(
+				account.id(),
+				first_workspace.id(),
+				&first_fingerprint,
+				"first device",
+				now,
+			)
+			.unwrap();
+		manager
+			.register_device_credential(
+				account.id(),
+				second_workspace.id(),
+				&second_fingerprint,
+				"second device",
+				now,
+			)
+			.unwrap();
+		let first_identity =
+			authenticate_test_identity(&manager, &first_key, &first_fingerprint);
+		let second_identity =
+			authenticate_test_identity(&manager, &second_key, &second_fingerprint);
+		manager
+			.record_usage(
+				first_identity,
+				period_start,
+				UsageDelta::new(0, 2, 1).unwrap(),
+			)
+			.unwrap();
+		manager
+			.record_usage(
+				second_identity,
+				period_start,
+				UsageDelta::new(0, 1, 1).unwrap(),
+			)
+			.unwrap();
+
+		let limiter = CustomerDataLimiter::new(
+			SingleTierPolicy::parse(Some("10")).unwrap(),
+			4,
+		)
+		.unwrap();
+		let first_session = limiter
+			.open_session(manager.clone(), first_identity, period_start)
+			.unwrap();
+		let second_session = limiter
+			.open_session(manager.clone(), second_identity, period_start)
+			.unwrap();
+
+		assert_eq!(
+			first_session.allow(3).unwrap(),
+			super::CustomerDataAllowance {
+				bytes: 3,
+				exhausted: false,
+			}
+		);
+		assert_eq!(
+			second_session.allow(4).unwrap(),
+			super::CustomerDataAllowance {
+				bytes: 2,
+				exhausted: true,
+			}
+		);
+		assert!(matches!(
+			first_session.allow(1),
+			Err(CustomerDataAdmissionError::LimitReached { limit: 10 })
+		));
+	}
+
+	#[test]
+	fn concurrent_customer_data_reservations_cannot_exceed_the_limit() {
+		let usage = Arc::new(super::CustomerPeriodUsage::new(0, 1));
+		let barrier = Arc::new(std::sync::Barrier::new(16));
+		let allowed = std::thread::scope(|scope| {
+			let handles = (0..16)
+				.map(|_| {
+					let usage = usage.clone();
+					let barrier = barrier.clone();
+					scope.spawn(move || {
+						barrier.wait();
+						usage.allow(10, 100).map_or(0, |allowance| allowance.bytes)
+					})
+				})
+				.collect::<Vec<_>>();
+			handles
+				.into_iter()
+				.map(|handle| handle.join().unwrap())
+				.sum::<usize>()
+		});
+
+		assert_eq!(allowed, 100);
+		assert!(matches!(
+			usage.allow(1, 100),
+			Err(CustomerDataAdmissionError::LimitReached { limit: 100 })
+		));
+	}
+
+	#[test]
+	fn customer_data_limit_rejects_accounts_outside_the_single_tier() {
+		let manager = Arc::new(
+			AccountManager::open_in_memory(
+				ApiKeyHasher::from_key(Zeroizing::new([0x74; blake3::KEY_LEN])),
+				4,
+			)
+			.unwrap(),
+		);
+		let identity = provision_limited_test_identity(
+			&manager,
+			"mismatched-tier@example.com",
+			0x75,
+			10,
+		);
+		let limiter = CustomerDataLimiter::new(
+			SingleTierPolicy::parse(Some("11")).unwrap(),
+			4,
+		)
+		.unwrap();
+
+		assert!(matches!(
+			limiter.open_session(manager, identity, UnixTimestamp::new(0).unwrap()),
+			Err(CustomerDataAdmissionError::TierConfigurationMismatch {
+				configured_limit: 11,
+				stored_limit: Some(10),
+			})
+		));
+	}
+
+	#[test]
+	fn customer_data_checkpoint_persists_directional_deltas() {
+		Runtime::new().unwrap().block_on(async {
+			let manager = Arc::new(
+				AccountManager::open_in_memory(
+					ApiKeyHasher::from_key(Zeroizing::new([0x76; blake3::KEY_LEN])),
+					4,
+				)
+				.unwrap(),
+			);
+			let identity = provision_limited_test_identity(
+				&manager,
+				"checkpoint@example.com",
+				0x77,
+				100,
+			);
+			let period_start = UnixTimestamp::new(0).unwrap();
+			let limiter = CustomerDataLimiter::new(
+				SingleTierPolicy::parse(Some("100")).unwrap(),
+				4,
+			)
+			.unwrap();
+			let session = limiter
+				.open_session(manager.clone(), identity, period_start)
+				.unwrap();
+			session.allow(7).unwrap();
+			session.record_transferred(CustomerDataDirection::ToTor, 7);
+			session.allow(5).unwrap();
+			session.record_transferred(CustomerDataDirection::FromTor, 5);
+
+			session.checkpoint().await.unwrap();
+			session.checkpoint().await.unwrap();
+
+			let usage = manager.usage(identity, period_start).unwrap();
+			assert_eq!(usage.bytes_to_tor(), 7);
+			assert_eq!(usage.bytes_from_tor(), 5);
+		});
 	}
 
 	#[test]
@@ -4080,6 +5026,59 @@ mod tests {
 	}
 
 	#[test]
+	fn tunnel_copy_stops_at_the_exact_customer_data_boundary() {
+		Runtime::new().unwrap().block_on(async {
+			let manager = Arc::new(
+				AccountManager::open_in_memory(
+					ApiKeyHasher::from_key(Zeroizing::new([0x78; blake3::KEY_LEN])),
+					4,
+				)
+				.unwrap(),
+			);
+			let identity = provision_limited_test_identity(
+				&manager,
+				"exact-boundary@example.com",
+				0x79,
+				5,
+			);
+			let period_start = UnixTimestamp::new(0).unwrap();
+			let limiter = CustomerDataLimiter::new(
+				SingleTierPolicy::parse(Some("5")).unwrap(),
+				4,
+			)
+			.unwrap();
+			let session = limiter
+				.open_session(manager.clone(), identity, period_start)
+				.unwrap();
+			let (writer, flushed, _flush_count) = FlushGatedWriter::new();
+			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
+
+			let error = copy_one_direction_with_customer_data(
+				std::io::Cursor::new(b"abcdefgh".to_vec()),
+				writer,
+				activity,
+				None,
+				None,
+				Some(&session),
+				CustomerDataDirection::ToTor,
+			)
+			.await
+			.unwrap_err();
+
+			assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+			assert_eq!(
+				flushed
+					.lock()
+					.unwrap_or_else(|poisoned| poisoned.into_inner())
+					.as_slice(),
+				b"abcde",
+			);
+			session.checkpoint().await.unwrap();
+			assert_eq!(manager.usage(identity, period_start).unwrap().total_bytes().unwrap(), 5);
+		});
+	}
+
+	#[test]
 	fn tunnel_copy_normalizes_only_closed_stream_teardown() {
 		Runtime::new().unwrap().block_on(async {
 			let (activity, _activity_rx) = tokio::sync::watch::channel(0_u64);
@@ -4202,6 +5201,8 @@ mod tests {
 		metrics.record_request("GET", 200, Duration::from_millis(25));
 		metrics.cache_hits.store(2, Ordering::Relaxed);
 		metrics.bytes_to_tor.store(123, Ordering::Relaxed);
+		metrics.customer_data_limit_rejections.store(3, Ordering::Relaxed);
+		metrics.account_usage_checkpoint_failures.store(1, Ordering::Relaxed);
 		metrics.bridge_tasks_completed.store(4, Ordering::Relaxed);
 		metrics.bridge_tasks_deadline_cancelled.store(1, Ordering::Relaxed);
 		metrics.record_arti_failure("timeout");
@@ -4215,6 +5216,8 @@ mod tests {
 		assert!(rendered.contains("proxy_requests_total{method=\"GET\",status=\"200\"} 1"));
 		assert!(rendered.contains("proxy_cache_hits_total 2"));
 		assert!(rendered.contains("proxy_bytes_to_tor_total 123"));
+		assert!(rendered.contains("proxy_customer_data_limit_rejections_total 3"));
+		assert!(rendered.contains("proxy_account_usage_checkpoint_failures_total 1"));
 		assert!(rendered.contains("proxy_bridge_tasks_completed_total 4"));
 		assert!(rendered.contains("proxy_bridge_tasks_deadline_cancelled_total 1"));
 		assert!(rendered.contains("proxy_arti_failures_total{class=\"timeout\"} 1"));

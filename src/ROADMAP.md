@@ -188,8 +188,10 @@ matrix; plaintext access and unauthenticated access cannot reach Tor.
 
 Per-account request rate, concurrent-tunnel admission, credential revocation,
 atomic request-quota admission, and aggregate request/byte usage writes are now
-connected to production ingress. Certificate reload/rotation, operational
-health checks, alerting, crash-period usage checkpointing, and the controlled
+connected to production ingress. The single-tier runtime now also enforces an
+account-wide live byte cap across workspaces and checkpoints active usage every
+MiB or five seconds. Cross-process quota coordination, certificate
+reload/rotation, operational health checks, alerting, and the controlled
 deployment matrix remain open.
 
 **Gate:** suspension, quota, slow-handshake, slow-header, and capacity tests

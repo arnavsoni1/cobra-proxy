@@ -131,6 +131,7 @@ Required production settings:
 | `PROXY_INGRESS_CLIENT_CA` | PEM CA roots trusted to issue client certificates |
 | `PROXY_ACCOUNT_DATABASE` | Owner-only SQLite account/credential/usage database |
 | `PROXY_API_KEY_HASH_KEY_FILE` | Owner-only regular file containing exactly 32 random bytes |
+| `PROXY_SINGLE_TIER_PERIOD_BYTE_LIMIT` | Combined upload and download bytes allowed to one account in each usage period |
 
 Optional positive integer settings:
 
@@ -155,6 +156,24 @@ The account database must already contain an active account/workspace, a hashed
 API key, and the SHA-256 fingerprint of the approved client leaf certificate.
 The account module exposes provisioning and revocation operations, but a
 customer dashboard or production admin CLI has not yet been added.
+
+For the initial single-tier launch, every account must store the same non-zero
+`period_byte_limit` as `PROXY_SINGLE_TIER_PERIOD_BYTE_LIMIT`. A mismatch fails
+closed when that account authenticates; changing the allowance therefore
+requires updating the stored account limits and restarting the service with the
+matching setting. The configured value is a technical allowance, not a price or
+billing-provider product identifier.
+
+The allowance is enforced per account across all of its workspaces and active
+tunnels, counting payload bytes in both directions. New requests receive `429`
+when no allowance remains. A tunnel that consumes the final bytes is closed at
+the exact boundary. Active usage is persisted after each MiB, every five
+seconds, and when the tunnel closes, whichever happens first.
+
+This launch implementation assumes one running proxy process. Its live budget
+is process-local, so multiple replicas sharing the SQLite database could each
+admit part of the same remaining allowance. Do not scale to multiple service
+processes until quota reservation is coordinated transactionally across them.
 
 An authorized client can verify an already provisioned endpoint with an HTTPS
 proxy-capable curl:
@@ -208,6 +227,7 @@ The runtime keeps separate limits because they protect different resources:
 | Internal connection-task limit | Prevents the public cap from starving Pingora-to-bridge work | 512 |
 | Active-tunnel limit | Caps established long-lived tunnels | 256 |
 | Per-account tunnel/rate limits | Enforces the active account plan | Stored per account |
+| Per-customer period data limit | Caps combined traffic across workspaces and tunnels | One required single-tier value in production |
 | Circuit-build limit | Caps expensive concurrent Tor connect/build operations | 32 |
 
 An active tunnel may wait briefly for capacity. A circuit build may wait longer because circuit construction is expensive and bursty. If the relevant wait expires, the client receives `503 Service Unavailable` with a retry hint.
@@ -290,7 +310,7 @@ backups for account data, and an emergency abuse-response procedure.
 ## Known limitations
 
 - Authentication, revocation, rate limits, concurrent-tunnel limits, and aggregate SQLite usage accounting are active only in production ingress mode. There is no billing integration, dashboard, or production admin CLI yet.
-- Usage bytes are committed when a Tor transport closes; a process crash during an active tunnel can lose that tunnel's uncommitted usage, and an active tunnel can exceed a period byte cap before its final total is recorded.
+- The account-wide data cap is exact within one running service process. A crash can lose at most the usage transferred since the last one-MiB/five-second checkpoint, and multi-process quota coordination is not implemented.
 - Certificate reload/rotation, live production monitoring, and target-host rollback drills remain unimplemented or unverified.
 - The default listener configuration is suitable for local development, not direct Internet exposure.
 - Isolation does not guarantee different exit IP addresses or immunity from traffic correlation.
