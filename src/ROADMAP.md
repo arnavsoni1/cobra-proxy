@@ -9,6 +9,8 @@ its documented verification gate first.
 
 ```text
 docs/
+  audits/          dated implementation and documentation reconciliation
+  decisions/       reviewed architectural choices and adoption gates
   plans/ingress/   future client-ingress and transport-security work
   plans/firewall/  future egress containment and network-boundary work
   architecture/    current verified architecture, added when needed
@@ -19,6 +21,11 @@ Current detailed plans:
 
 - [Rustls private ingress](../docs/plans/ingress/rustls-private-ingress.md)
 - [Firewall egress hardening](../docs/plans/firewall/egress-hardening.md)
+
+Current decisions and audits:
+
+- [libp2p adoption boundary](../docs/decisions/libp2p-adoption-boundary.md)
+- [Markdown implementation and conflict audit, 2026-08-09](../docs/audits/markdown-implementation-audit-2026-08-09.md)
 
 ## Phase 0 — Preserve the verified core
 

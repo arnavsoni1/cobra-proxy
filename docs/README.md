@@ -9,6 +9,8 @@ to be changed or deployed.
 ```text
 docs/
   README.md                 this navigation and structure guide
+  audits/                   dated code-to-document reconciliation snapshots
+  decisions/                reviewed architectural choices and adoption gates
   plans/                    reviewed future-state work, not yet deployed
     ingress/                client ingress and transport security plans
     firewall/               egress containment and network-boundary plans
@@ -19,6 +21,18 @@ docs/
 Only directories with current content are created now. Add `architecture/` or
 `runbooks/` when there is a real document to place in them; do not create empty
 placeholder trees.
+
+## Current audits
+
+- [Markdown implementation and conflict audit, 2026-08-09](audits/markdown-implementation-audit-2026-08-09.md)
+  — implemented behavior, remaining work, and contradictions across every
+  project-authored Markdown file.
+
+## Current decisions
+
+- [libp2p adoption boundary](decisions/libp2p-adoption-boundary.md) — why
+  libp2p is not a Tor mid-session fallback, the future multi-peer cases where
+  it could be justified, and the gates required before adoption.
 
 ## Current plans
 
@@ -33,6 +47,10 @@ placeholder trees.
 
 - A **plan** describes proposed work, its constraints, verification gates, and
   rollback conditions. It is not authorization to alter a production host.
+- A **decision** records a reviewed architectural boundary and the conditions
+  that must be met before that boundary changes.
+- An **audit** is dated evidence about a repository snapshot. It does not turn
+  an unverified plan into deployed behavior.
 - A **runbook** describes an already-reviewed and reproducible operational
   procedure. It must name the owner, exact prerequisites, verification, and
   rollback path.
