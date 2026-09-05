@@ -146,7 +146,7 @@ cargo test --locked -- --list
 
 ### Ignored controlled-origin functional matrix
 
-`controlled_origin_functional_matrix` is ignored by the normal suite because it needs a separately running proxy, `curl`, and authorized external origins. It checks plain HTTP, session-isolated HTTPS, strict HTTPS, and a second cache request reporting `X-Proxy-Cache: HIT`.
+`controlled_origin_functional_matrix` is ignored by the normal suite because it needs a separately running development proxy, `curl`, and authorized external origins. It checks plain HTTP, session-isolated HTTPS, strict HTTPS, and confirms that repeated development-mode HTTP responses do not expose `X-Proxy-Cache`. Development ingress is intentionally unauthenticated and therefore cannot prove the positive production-cache path.
 
 Start the proxy in one terminal and wait for it to become ready:
 
@@ -163,7 +163,7 @@ PROXY_TEST_CACHEABLE_URL=http://origin.example/cacheable \
 cargo test --locked controlled_origin_functional_matrix -- --ignored --nocapture
 ```
 
-The test always uses the proxy at `127.0.0.1:8080`. Prefer the deployment runner's `--cache-url` workflow when retained logs and response evidence are needed.
+The test always uses the proxy at `127.0.0.1:8080`. Use the deployment runner against an authenticated running deployment when a real tenant-scoped cache hit must be proved.
 
 ### Ignored local transport benchmark
 
@@ -403,14 +403,19 @@ Running mode does not build, start, stop, or collect the service's process log. 
 
 Run against a quiet, isolated instance when possible. On a shared service, unrelated traffic can change metrics between the baseline and final snapshot, making activity-delta checks less attributable to this run.
 
-### Optional cache check
+### Authenticated cache check
 
 ```bash
-./test-deployment.sh \
-  --cache-url http://your-authorized-origin.example/cacheable
+./test-deployment.sh --mode running \
+  --proxy-url https://proxy.example:8443 \
+  --proxy-curl-config /run/proxy/deployment-test.curlrc \
+  --cache-url http://your-authorized-origin.example/cacheable \
+  --cache-count-url https://your-authorized-origin.example/request-count
 ```
 
-The runner requests the same controlled URL twice with the same isolation identity and requires the second response to include `X-Proxy-Cache: HIT`. In running mode, the first request may already be a hit if the process cache was warm; the script asserts the second hit but does not require the first response to be a miss or compare the two bodies.
+The exact cache origin must also be present in the deployment's `PROXY_CACHE_ALLOWED_HTTP_ORIGINS`. The counter endpoint must return only the integer count of requests received by the cacheable endpoint and must not increment that count itself. The owner-only curl config supplies the production proxy CA, client certificate/key, and proxy API-key authentication without placing those credentials in the evidence bundle or command line.
+
+The runner uses a unique isolation subdivision, requests the controlled URL twice, and requires identical bodies, exactly one new controlled-origin fetch, an increase in `proxy_cache_hits_total`, and no `X-Proxy-Cache` response header. Local development mode skips this check because unauthenticated traffic is required to bypass the production cache.
 
 ### Deployment options and environment
 
@@ -425,13 +430,15 @@ Run `./test-deployment.sh --help` for the current interface.
 | `--http-url URL` | Plain-HTTP forwarding target |
 | `--https-url URL` | HTTPS strict-isolation target |
 | `--cache-url URL` | Optional plain-HTTP controlled cache target |
+| `--cache-count-url URL` | Counter endpoint for the controlled cache target; required with `--cache-url` |
+| `--proxy-curl-config PATH` | Owner-only curl config containing production proxy TLS and authentication options |
 | `--startup-timeout N` | Readiness wait in seconds |
 | `--request-timeout N` | Per-request timeout in seconds |
 | `--skip-build` | Local mode only; reuse `target/release/proxy` |
 | `--keep-running` | Local mode only; leave the test-owned process running |
 | `--artifacts-dir PATH` | Override the evidence directory |
 
-Equivalent defaults can be set with `PROXY_URL`, `PROXY_METRICS_URL`, `TOR_CHECK_URL`, `PROXY_TEST_HTTP_URL`, `PROXY_TEST_HTTPS_URL`, `PROXY_TEST_CACHEABLE_URL`, `PROXY_START_TIMEOUT_SECONDS`, and `PROXY_REQUEST_TIMEOUT_SECONDS`. Explicit CLI options take precedence over environment defaults.
+Equivalent defaults can be set with `PROXY_URL`, `PROXY_METRICS_URL`, `TOR_CHECK_URL`, `PROXY_TEST_HTTP_URL`, `PROXY_TEST_HTTPS_URL`, `PROXY_TEST_CACHEABLE_URL`, `PROXY_TEST_CACHE_ORIGIN_COUNT_URL`, `PROXY_TEST_CURL_CONFIG`, `PROXY_START_TIMEOUT_SECONDS`, and `PROXY_REQUEST_TIMEOUT_SECONDS`. Explicit CLI options take precedence over environment defaults.
 
 For a local test-owned process, the deployment, Unix smoke, and stress runners set
 `PROXY_SHUTDOWN_DRAIN_SECONDS` and
@@ -463,7 +470,7 @@ Setup failures stop the matrix because later checks would not have a valid targe
 | `tor_session` | Session isolation and Tor egress | Tor Check returns JSON containing `IsTor=true` | Tor path, TLS, endpoint, isolation, or wrong-proxy problem |
 | `strict_https` | Strict-isolation HTTPS | Configured origin returns 2xx or 3xx | Strict stream, TLS, Tor exit, or origin problem |
 | `plain_http` | Public ingress → Pingora → bridge → Tor | Configured HTTP origin returns 2xx or 3xx | HTTP dispatch, bridge, Tor, exit, or origin problem |
-| `controlled_cache` | Repeat cache lookup | Second controlled response says `X-Proxy-Cache: HIT` | Ineligible origin response or cache pipeline problem; skipped without a cache URL |
+| `controlled_cache` | Scoped lookup, insertion, and oracle removal | Bodies match, origin count rises once, hit metric rises, and neither response exposes `X-Proxy-Cache` | Authentication, allowlist, response admission, scoped key, TTL, or metrics problem; skipped outside authenticated running mode |
 | `metrics_activity` | Observable effects of this run | Tor-received bytes and isolation-token count increase from baseline | No completed data path, stale/wrong metrics, or noisy shared deployment |
 | `deployment_survived` | Final health | Local process still exists when owned, and metrics respond | Crash or health endpoint loss during the matrix |
 
@@ -495,7 +502,9 @@ Use a new or empty override directory for each run; fixed override directories c
 | `tor-check-session.json` | Tor Check response body | Verify `IsTor` and inspect the returned exit IP; may be absent/partial on curl failure |
 | `http-response.headers` / `.body` | Plain-HTTP origin response | Inspect origin status, cache headers, and returned content |
 | `https-response.headers` / `.body` | Strict HTTPS origin response | Inspect origin status and content when TLS succeeds |
-| `cache-first.*` / `cache-second.*` | Optional cache responses | Compare `X-Proxy-Cache` and origin behavior |
+| `cache-first.*` / `cache-second.*` | Controlled cache responses | Compare bodies and confirm cache-status headers are absent |
+| `cache-origin-count.before.txt` / `.after.txt` | Controlled origin request counters | Prove the two proxy requests caused exactly one origin fetch |
+| `cache-metrics.before.prom` / `.after.prom` | Cache-specific metric snapshots | Prove the tenant-scoped hit counter increased |
 
 Response artifacts can contain origin content and the Tor exit IP. They are Git-ignored but should still be handled according to the project's data-retention and privacy practices.
 

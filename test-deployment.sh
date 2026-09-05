@@ -12,6 +12,8 @@ tor_check_url="${TOR_CHECK_URL:-https://check.torproject.org/api/ip}"
 http_test_url="${PROXY_TEST_HTTP_URL:-http://example.com/}"
 https_test_url="${PROXY_TEST_HTTPS_URL:-https://example.com/}"
 cache_test_url="${PROXY_TEST_CACHEABLE_URL:-}"
+cache_count_url="${PROXY_TEST_CACHE_ORIGIN_COUNT_URL:-}"
+proxy_curl_config="${PROXY_TEST_CURL_CONFIG:-}"
 startup_timeout_seconds="${PROXY_START_TIMEOUT_SECONDS:-180}"
 request_timeout_seconds="${PROXY_REQUEST_TIMEOUT_SECONDS:-120}"
 local_shutdown_drain_seconds="${PROXY_TEST_SHUTDOWN_DRAIN_SECONDS:-1}"
@@ -38,6 +40,8 @@ Options:
   --http-url URL           Plain-HTTP functional endpoint
   --https-url URL          HTTPS functional endpoint
   --cache-url URL          Controlled cacheable HTTP endpoint (optional)
+  --cache-count-url URL    Counter endpoint for the controlled cache origin
+  --proxy-curl-config PATH Owner-only curl config for production proxy auth
   --startup-timeout N      Readiness timeout in seconds (default: 180)
   --request-timeout N      Per-request timeout in seconds (default: 120)
   --skip-build             In local mode, reuse target/release/proxy
@@ -54,6 +58,9 @@ Examples:
 
 The cache endpoint must be infrastructure you are authorized to test. It must
 return a successful response with Cache-Control: public and a positive max-age.
+The counter endpoint must report only that endpoint's integer request count.
+Positive cache verification requires authenticated running mode and an exact
+deployment allowlist entry; local development traffic intentionally bypasses.
 USAGE
 }
 
@@ -85,6 +92,14 @@ while (( $# > 0 )); do
 			;;
 		--cache-url)
 			cache_test_url="${2:?missing value for --cache-url}"
+			shift 2
+			;;
+		--cache-count-url)
+			cache_count_url="${2:?missing value for --cache-count-url}"
+			shift 2
+			;;
+		--proxy-curl-config)
+			proxy_curl_config="${2:?missing value for --proxy-curl-config}"
 			shift 2
 			;;
 		--startup-timeout)
@@ -161,6 +176,22 @@ if [[ -n "$cache_test_url" && "$cache_test_url" != http://* ]]; then
 	echo "error: --cache-url must be a plain-HTTP URL" >&2
 	exit 2
 fi
+if [[ -n "$cache_count_url" && "$cache_count_url" != http://* && "$cache_count_url" != https://* ]]; then
+	echo "error: --cache-count-url must be an HTTP(S) URL" >&2
+	exit 2
+fi
+if [[ -n "$cache_test_url" && -z "$cache_count_url" ]]; then
+	echo "error: --cache-url requires --cache-count-url" >&2
+	exit 2
+fi
+if [[ -n "$cache_count_url" && -z "$cache_test_url" ]]; then
+	echo "error: --cache-count-url requires --cache-url" >&2
+	exit 2
+fi
+if [[ -n "$proxy_curl_config" && ! -r "$proxy_curl_config" ]]; then
+	echo "error: --proxy-curl-config must name a readable file" >&2
+	exit 2
+fi
 if [[ "$mode" == "local" ]]; then
 	if [[ "$proxy_url" != "http://127.0.0.1:8080" || "$metrics_url" != "http://127.0.0.1:9090/metrics" ]]; then
 		echo "error: local mode uses the binary's fixed loopback endpoints" >&2
@@ -176,7 +207,7 @@ else
 	fi
 fi
 
-for command_name in curl awk grep sed tee tr; do
+for command_name in curl awk cmp grep sed tee tr; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		echo "error: required command not found: $command_name" >&2
 		exit 2
@@ -238,6 +269,14 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
+
+proxy_curl() {
+	if [[ -n "$proxy_curl_config" ]]; then
+		curl --config "$proxy_curl_config" "$@"
+	else
+		curl "$@"
+	fi
+}
 
 write_summary() {
 	{
@@ -403,7 +442,7 @@ metrics_path_is_private_case() {
 
 blocked_destination_case() {
 	local connect_status curl_status
-	connect_status="$(curl --silent --show-error --insecure --noproxy '' \
+	connect_status="$(proxy_curl --silent --show-error --insecure --noproxy '' \
 		--max-time 15 --proxy "$proxy_url" --output /dev/null \
 		--write-out '%{http_connect}' https://127.0.0.1:443/)" && curl_status=0 || curl_status=$?
 	if [[ "$connect_status" != "403" ]]; then
@@ -414,7 +453,7 @@ blocked_destination_case() {
 
 invalid_isolation_case() {
 	local connect_status curl_status
-	connect_status="$(curl --silent --show-error --insecure --noproxy '' \
+	connect_status="$(proxy_curl --silent --show-error --insecure --noproxy '' \
 		--max-time 15 --proxy "$proxy_url" --output /dev/null \
 		--proxy-header 'X-Proxy-Isolation: invalid identity' \
 		--write-out '%{http_connect}' https://example.com/)" && curl_status=0 || curl_status=$?
@@ -427,7 +466,7 @@ invalid_isolation_case() {
 tor_session_routing_case() {
 	local response_file="$artifacts_dir/tor-check-session.json"
 	local compact_response
-	curl --fail --silent --show-error --noproxy '' \
+	proxy_curl --fail --silent --show-error --noproxy '' \
 		--retry 1 --retry-all-errors --max-time "$request_timeout_seconds" \
 		--proxy "$proxy_url" \
 		--proxy-header "X-Proxy-Isolation: deployment-$run_stamp" \
@@ -443,7 +482,7 @@ tor_session_routing_case() {
 
 strict_https_case() {
 	local status
-	status="$(curl --silent --show-error --noproxy '' \
+	status="$(proxy_curl --silent --show-error --noproxy '' \
 		--max-time "$request_timeout_seconds" --proxy "$proxy_url" \
 		--proxy-header 'X-Proxy-Isolation-Mode: strict' \
 		--output "$artifacts_dir/https-response.body" \
@@ -457,7 +496,7 @@ strict_https_case() {
 
 plain_http_case() {
 	local status
-	status="$(curl --silent --show-error --noproxy '' \
+	status="$(proxy_curl --silent --show-error --noproxy '' \
 		--max-time "$request_timeout_seconds" --proxy "$proxy_url" \
 		--output "$artifacts_dir/http-response.body" \
 		--dump-header "$artifacts_dir/http-response.headers" \
@@ -472,24 +511,55 @@ cache_case() {
 	local first_headers="$artifacts_dir/cache-first.headers"
 	local second_headers="$artifacts_dir/cache-second.headers"
 	local cache_identity="cache-$run_stamp"
+	local cache_metrics_before="$artifacts_dir/cache-metrics.before.prom"
+	local cache_metrics_after="$artifacts_dir/cache-metrics.after.prom"
+	local origin_count_before_file="$artifacts_dir/cache-origin-count.before.txt"
+	local origin_count_after_file="$artifacts_dir/cache-origin-count.after.txt"
+	local hits_before hits_after origin_count_before origin_count_after
 
-	curl --fail --silent --show-error --noproxy '' \
+	curl --fail --silent --show-error --max-time 10 "$metrics_url" \
+		--output "$cache_metrics_before" || return 1
+	curl --fail --silent --show-error --max-time 10 "$cache_count_url" \
+		--output "$origin_count_before_file" || return 1
+
+	proxy_curl --fail --silent --show-error --noproxy '' \
 		--max-time "$request_timeout_seconds" --proxy "$proxy_url" \
 		--proxy-header "X-Proxy-Isolation: $cache_identity" \
 		--dump-header "$first_headers" --output "$artifacts_dir/cache-first.body" \
 		"$cache_test_url" || return 1
-	curl --fail --silent --show-error --noproxy '' \
+	proxy_curl --fail --silent --show-error --noproxy '' \
 		--max-time "$request_timeout_seconds" --proxy "$proxy_url" \
 		--proxy-header "X-Proxy-Isolation: $cache_identity" \
 		--dump-header "$second_headers" --output "$artifacts_dir/cache-second.body" \
 		"$cache_test_url" || return 1
 
-	if ! tr -d '\r' < "$second_headers" | grep -qi '^x-proxy-cache:[[:space:]]*hit$'; then
-		echo "second controlled request was not a cache hit" >&2
-		echo "first response cache header:" >&2
-		tr -d '\r' < "$first_headers" | grep -i '^x-proxy-cache:' >&2 || true
-		echo "second response cache header:" >&2
-		tr -d '\r' < "$second_headers" | grep -i '^x-proxy-cache:' >&2 || true
+	curl --fail --silent --show-error --max-time 10 "$cache_count_url" \
+		--output "$origin_count_after_file" || return 1
+	curl --fail --silent --show-error --max-time 10 "$metrics_url" \
+		--output "$cache_metrics_after" || return 1
+
+	if ! cmp -s "$artifacts_dir/cache-first.body" "$artifacts_dir/cache-second.body"; then
+		echo "controlled cache responses differed" >&2
+		return 1
+	fi
+	if tr -d '\r' < "$first_headers" | grep -qi '^x-proxy-cache:' ||
+		tr -d '\r' < "$second_headers" | grep -qi '^x-proxy-cache:'; then
+		echo "a controlled response exposed the forbidden X-Proxy-Cache header" >&2
+		return 1
+	fi
+
+	hits_before="$(metric_value proxy_cache_hits_total "$cache_metrics_before")"
+	hits_after="$(metric_value proxy_cache_hits_total "$cache_metrics_after")"
+	origin_count_before="$(tr -d '[:space:]' < "$origin_count_before_file")"
+	origin_count_after="$(tr -d '[:space:]' < "$origin_count_after_file")"
+	if [[ ! "$hits_before" =~ ^[0-9]+$ || ! "$hits_after" =~ ^[0-9]+$ ]] ||
+		(( hits_after <= hits_before )); then
+		echo "tenant-scoped cache hit counter did not increase ($hits_before -> $hits_after)" >&2
+		return 1
+	fi
+	if [[ ! "$origin_count_before" =~ ^[0-9]+$ || ! "$origin_count_after" =~ ^[0-9]+$ ]] ||
+		(( origin_count_after != origin_count_before + 1 )); then
+		echo "controlled origin count did not increase exactly once ($origin_count_before -> $origin_count_after)" >&2
 		return 1
 	fi
 }
@@ -584,10 +654,12 @@ run_case invalid_isolation "Rejecting malformed isolation metadata" invalid_isol
 run_case tor_session "Verifying session-isolated HTTPS traffic exits through Tor" tor_session_routing_case || true
 run_case strict_https "Verifying strict-isolation HTTPS forwarding" strict_https_case || true
 run_case plain_http "Verifying the ordinary HTTP forwarding pipeline" plain_http_case || true
-if [[ -n "$cache_test_url" ]]; then
+if [[ -n "$cache_test_url" && "$mode" == "running" ]]; then
 	run_case controlled_cache "Verifying a cold fetch followed by a cache hit" cache_case || true
+elif [[ -n "$cache_test_url" ]]; then
+	skip_case controlled_cache "authenticated running mode is required for production cache access"
 else
-	skip_case controlled_cache "set --cache-url to an authorized cacheable origin"
+	skip_case controlled_cache "set --cache-url and --cache-count-url for an authenticated running deployment"
 fi
 run_case metrics_activity "Confirming this run changed Tor byte and isolation metrics" metrics_activity_case || true
 run_case deployment_survived "Confirming the deployment remained healthy" process_survived_case || true

@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest as _, Sha256};
 use std::{
-	collections::{BTreeMap, HashMap},
+	collections::{BTreeMap, BTreeSet, HashMap},
 	fmt,
 	future::Future,
 	hash::{Hash, Hasher},
@@ -47,7 +47,7 @@ use std::{
 	},
 	marker::PhantomData,
 	path::Path,
-	time::Instant as StdInstant
+	time::{Instant as StdInstant, SystemTime}
 	//error::Error
 };
 use pingora_memory_cache::MemoryCache; 
@@ -80,6 +80,11 @@ const CACHE_LRU_SHARDS: usize = 16;
 const CACHE_ITEMS_PER_SHARD: usize = 1_024;
 const CACHE_LOCK_MAX_AGE: Duration = Duration::from_secs(60);
 const CACHE_MAX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
+const CACHE_ALLOWED_HTTP_ORIGINS_ENV: &str = "PROXY_CACHE_ALLOWED_HTTP_ORIGINS";
+const CACHE_MAX_TTL_SECONDS_ENV: &str = "PROXY_CACHE_MAX_TTL_SECONDS";
+const CACHE_DEFAULT_MAX_TTL: Duration = Duration::from_secs(60);
+const CACHE_ABSOLUTE_MAX_TTL: Duration = Duration::from_secs(300);
+const CACHE_KEY_NAMESPACE_VERSION: &str = "proxy-http-cache-v2\0";
 const MAX_CONNECT_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONNECT_HEADERS: usize = 64;
 const ISOLATION_HEADER: &str = "X-Proxy-Isolation";
@@ -237,9 +242,19 @@ impl IsolationStore {
 	}
 
 	fn rotate(&self, identity: &str) -> IsolationMaterial {
-		let token = IsolationToken::new();
-		self.put(identity, token, None);
-		self.material_for(identity)
+		let now = StdInstant::now();
+		let material = IsolationMaterial {
+			token: IsolationToken::new(),
+			group_key: ISOLATION_GROUP_COUNTER.fetch_add(1, Ordering::Relaxed),
+		};
+		let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		inner.entries.retain(|_, entry| entry.expires_at > now);
+		inner.entries.insert(identity.to_owned(), IsolationEntry {
+			material,
+			last_used: now,
+			expires_at: now + self.ttl,
+		});
+		material
 	}
 
 	fn len(&self) -> usize {
@@ -289,6 +304,22 @@ impl TenantIsolationHasher {
 			strict: request.strict,
 		}
 	}
+
+	fn cache_scope(
+		&self,
+		identity: IngressIdentity,
+		resolved_isolation_identity: &str,
+		isolation_group_key: u64,
+	) -> OpaqueCacheScope {
+		let mut hasher =
+			Blake3HashAdapter(blake3::Hasher::new_keyed(self.key.as_ref()));
+		hasher.0.update(b"proxy-http-cache-scope-v2\0");
+		identity.account_id().hash(&mut hasher);
+		identity.workspace_id().hash(&mut hasher);
+		resolved_isolation_identity.hash(&mut hasher);
+		isolation_group_key.hash(&mut hasher);
+		OpaqueCacheScope(hasher.0.finalize().to_hex().to_string())
+	}
 }
 
 struct Blake3HashAdapter(blake3::Hasher);
@@ -302,6 +333,21 @@ impl Hasher for Blake3HashAdapter {
 
 	fn write(&mut self, bytes: &[u8]) {
 		self.0.update(bytes);
+	}
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct OpaqueCacheScope(String);
+
+impl OpaqueCacheScope {
+	fn as_str(&self) -> &str {
+		&self.0
+	}
+}
+
+impl fmt::Debug for OpaqueCacheScope {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str("OpaqueCacheScope([redacted])")
 	}
 }
 
@@ -1091,6 +1137,185 @@ fn cache_eviction() -> &'static (dyn EvictionManager + Sync) {
 	})
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachePolicy {
+	allowed_http_origins: BTreeSet<String>,
+	configured_max_ttl: Duration,
+	absolute_max_ttl: Duration,
+}
+
+impl CachePolicy {
+	fn from_environment(production: bool) -> anyhow::Result<Self> {
+		let allowed_origins = match std::env::var(CACHE_ALLOWED_HTTP_ORIGINS_ENV) {
+			Ok(value) => Some(value),
+			Err(std::env::VarError::NotPresent) => None,
+			Err(std::env::VarError::NotUnicode(_)) => {
+				anyhow::bail!("{CACHE_ALLOWED_HTTP_ORIGINS_ENV} must be valid UTF-8");
+			}
+		};
+		let configured_ttl = match std::env::var(CACHE_MAX_TTL_SECONDS_ENV) {
+			Ok(value) => Some(value),
+			Err(std::env::VarError::NotPresent) => None,
+			Err(std::env::VarError::NotUnicode(_)) => {
+				anyhow::bail!("{CACHE_MAX_TTL_SECONDS_ENV} must be valid UTF-8");
+			}
+		};
+		Self::parse(
+			allowed_origins.as_deref(),
+			configured_ttl.as_deref(),
+			production,
+		)
+	}
+
+	fn parse(
+		allowed_origins: Option<&str>,
+		configured_ttl_seconds: Option<&str>,
+		production: bool,
+	) -> anyhow::Result<Self> {
+		let mut canonical_origins = BTreeSet::new();
+		if let Some(allowed_origins) = allowed_origins {
+			if !allowed_origins.trim().is_empty() {
+				for origin in allowed_origins.split(',') {
+					let origin = origin.trim();
+					if origin.is_empty() {
+						anyhow::bail!(
+							"{CACHE_ALLOWED_HTTP_ORIGINS_ENV} contains an empty origin"
+						);
+					}
+					canonical_origins.insert(canonical_configured_http_origin(origin)?);
+				}
+			}
+		}
+		if production && canonical_origins.is_empty() {
+			anyhow::bail!(
+				"{CACHE_ALLOWED_HTTP_ORIGINS_ENV} must contain at least one reviewed origin in production mode"
+			);
+		}
+
+		let configured_max_ttl = match configured_ttl_seconds {
+			Some(value) => {
+				let seconds = value.trim().parse::<u64>().map_err(|_| {
+					anyhow::anyhow!(
+						"{CACHE_MAX_TTL_SECONDS_ENV} must be a positive integer"
+					)
+				})?;
+				if seconds == 0 {
+					anyhow::bail!("{CACHE_MAX_TTL_SECONDS_ENV} must be positive");
+				}
+				Duration::from_secs(seconds)
+			}
+			None => CACHE_DEFAULT_MAX_TTL,
+		};
+		if configured_max_ttl > CACHE_ABSOLUTE_MAX_TTL {
+			anyhow::bail!(
+				"{CACHE_MAX_TTL_SECONDS_ENV} must not exceed {} seconds",
+				CACHE_ABSOLUTE_MAX_TTL.as_secs()
+			);
+		}
+
+		Ok(Self {
+			allowed_http_origins: canonical_origins,
+			configured_max_ttl,
+			absolute_max_ttl: CACHE_ABSOLUTE_MAX_TTL,
+		})
+	}
+
+	fn allows(&self, canonical_origin: &str) -> bool {
+		self.allowed_http_origins.contains(canonical_origin)
+	}
+
+	fn effective_max_ttl(&self) -> Duration {
+		self.configured_max_ttl.min(self.absolute_max_ttl)
+	}
+}
+
+fn canonical_configured_http_origin(origin: &str) -> anyhow::Result<String> {
+	if origin.eq_ignore_ascii_case("all") || origin == "*" || origin.contains('*') {
+		anyhow::bail!("cache origin wildcards are not supported");
+	}
+	let Some((scheme, authority_text)) = origin.split_once("://") else {
+		anyhow::bail!("cache origin must include the http:// scheme");
+	};
+	if !scheme.eq_ignore_ascii_case("http") {
+		anyhow::bail!("cache origin scheme must be http");
+	}
+	if authority_text.is_empty()
+		|| authority_text.contains('/')
+		|| authority_text.contains('?')
+		|| authority_text.contains('#')
+		|| authority_text.contains('@')
+	{
+		anyhow::bail!("cache origin must be an authority without userinfo, path, query, or fragment");
+	}
+	let authority = authority_text
+		.parse::<http::uri::Authority>()
+		.map_err(|error| anyhow::anyhow!("invalid cache origin authority: {error}"))?;
+	let (host, port) = normalized_authority(&authority, "http");
+	if host.is_empty() || port == 0 {
+		anyhow::bail!("cache origin requires a non-empty host and non-zero port");
+	}
+	if !cache_origin_host_allowed(&host) {
+		anyhow::bail!("cache origin host is local, private, special-purpose, or ambiguous");
+	}
+	Ok(format_canonical_origin("http", &host, port))
+}
+
+fn cache_origin_host_allowed(host: &str) -> bool {
+	if host == "localhost"
+		|| host.ends_with(".localhost")
+		|| host.ends_with(".local")
+		|| host.ends_with(".internal")
+		|| host.ends_with(".home")
+		|| host.ends_with(".lan")
+	{
+		return false;
+	}
+
+	let Ok(address) = host.parse::<IpAddr>() else {
+		if host.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.') {
+			return false;
+		}
+		return host.len() <= 253 && host.split('.').all(|label| {
+			!label.is_empty()
+				&& label.len() <= 63
+				&& label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+				&& label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+				&& label
+					.bytes()
+					.all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+		});
+	};
+	match address {
+		IpAddr::V4(address) => {
+			let octets = address.octets();
+			!(octets[0] == 0
+				|| octets[0] == 10
+				|| octets[0] == 127
+				|| (octets[0] == 100 && (64..=127).contains(&octets[1]))
+				|| (octets[0] == 169 && octets[1] == 254)
+				|| (octets[0] == 172 && (16..=31).contains(&octets[1]))
+				|| (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+				|| (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+				|| (octets[0] == 192 && octets[1] == 168)
+				|| (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+				|| (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+				|| (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+				|| octets[0] >= 224)
+		}
+		IpAddr::V6(address) => {
+			let segments = address.segments();
+			address.to_ipv4().is_none()
+				&& !address.is_loopback()
+				&& !address.is_unspecified()
+				&& !address.is_multicast()
+				&& !address.is_unique_local()
+				&& !address.is_unicast_link_local()
+				&& (segments[0] & 0xe000) == 0x2000
+				&& !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+		}
+	}
+}
+
 fn normalized_authority(
 	authority: &http::uri::Authority,
 	scheme: &str,
@@ -1103,6 +1328,14 @@ fn normalized_authority(
 		.to_ascii_lowercase();
 	let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
 	(host, authority.port_u16().unwrap_or(default_port))
+}
+
+fn format_canonical_origin(scheme: &str, host: &str, port: u16) -> String {
+	if host.contains(':') {
+		format!("{scheme}://[{host}]:{port}")
+	} else {
+		format!("{scheme}://{host}:{port}")
+	}
 }
 
 fn canonical_cache_key_parts(request: &RequestHeader) -> anyhow::Result<(String, String)> {
@@ -1120,6 +1353,9 @@ fn canonical_cache_key_parts(request: &RequestHeader) -> anyhow::Result<(String,
 		anyhow::bail!("unsupported URI scheme");
 	}
 	let (host, port) = normalized_authority(&host_authority, &scheme);
+	if host.is_empty() || port == 0 {
+		anyhow::bail!("request authority requires a non-empty host and non-zero port");
+	}
 
 	if let Some(uri_authority) = request.uri.authority() {
 		let (uri_host, uri_port) = normalized_authority(uri_authority, &scheme);
@@ -1134,7 +1370,57 @@ fn canonical_cache_key_parts(request: &RequestHeader) -> anyhow::Result<(String,
 		.map(|value| value.as_str())
 		.unwrap_or("/")
 		.to_owned();
-	Ok((format!("{scheme}://{host}:{port}"), path_and_query))
+	Ok((format_canonical_origin(&scheme, &host, port), path_and_query))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CacheAccessDecision {
+	Eligible {
+		scope: OpaqueCacheScope,
+		canonical_origin: String,
+	},
+	BypassStrict,
+	BypassUnauthenticated,
+	BypassOriginNotAllowed,
+	BypassRequestPolicy,
+}
+
+fn cache_access_decision(
+	request: &RequestHeader,
+	ctx: &RequestCtx,
+	policy: &CachePolicy,
+) -> CacheAccessDecision {
+	if ctx.strict_isolation {
+		return CacheAccessDecision::BypassStrict;
+	}
+	let Some(scope) = ctx.cache_scope.clone() else {
+		return CacheAccessDecision::BypassUnauthenticated;
+	};
+	let Ok((canonical_origin, _)) = canonical_cache_key_parts(request) else {
+		return CacheAccessDecision::BypassRequestPolicy;
+	};
+	if !policy.allows(&canonical_origin) {
+		return CacheAccessDecision::BypassOriginNotAllowed;
+	}
+	if !request_cache_eligible(request) {
+		return CacheAccessDecision::BypassRequestPolicy;
+	}
+	CacheAccessDecision::Eligible {
+		scope,
+		canonical_origin,
+	}
+}
+
+fn scoped_cache_key(
+	request: &RequestHeader,
+	scope: &OpaqueCacheScope,
+) -> anyhow::Result<CacheKey> {
+	let (canonical_origin, path_and_query) = canonical_cache_key_parts(request)?;
+	Ok(CacheKey::new(
+		format!("{CACHE_KEY_NAMESPACE_VERSION}{canonical_origin}"),
+		path_and_query,
+		scope.as_str(),
+	))
 }
 
 fn request_cache_eligible(request: &RequestHeader) -> bool {
@@ -1155,8 +1441,8 @@ fn conservative_response_cacheable(
 	request: &RequestHeader,
 	response: &ResponseHeader,
 ) -> RespCacheable {
-	// This cache is deliberately shared across isolation identities for performance. Only
-	// explicitly public, non-personalized, non-varying responses can cross that boundary.
+	// Every admitted object is already partitioned by an authenticated opaque scope. These
+	// checks additionally prevent personalized or variant responses from entering that scope.
 	if !request_cache_eligible(request) {
 		return RespCacheable::Uncacheable(NoCacheReason::Custom("request-policy"));
 	}
@@ -1175,7 +1461,7 @@ fn conservative_response_cacheable(
 		return RespCacheable::Uncacheable(NoCacheReason::Custom("explicit-freshness-required"));
 	};
 	if !cache_control.public() || cache_control.private() || cache_control.no_store() {
-		return RespCacheable::Uncacheable(NoCacheReason::Custom("shared-cache-policy"));
+		return RespCacheable::Uncacheable(NoCacheReason::Custom("scoped-cache-policy"));
 	}
 	let positive_freshness = cache_control
 		.s_maxage()
@@ -1193,6 +1479,47 @@ fn conservative_response_cacheable(
 		false,
 		&CACHE_META_DEFAULTS,
 	)
+}
+
+fn bounded_response_cacheable(
+	request: &RequestHeader,
+	response: &ResponseHeader,
+	max_ttl: Duration,
+) -> (RespCacheable, bool, bool) {
+	let cacheable = conservative_response_cacheable(request, response);
+	let RespCacheable::Cacheable(meta) = cacheable else {
+		return (cacheable, false, false);
+	};
+	let admitted_at = SystemTime::now();
+	let Some(local_deadline) = admitted_at.checked_add(max_ttl.min(CACHE_ABSOLUTE_MAX_TTL)) else {
+		return (
+			RespCacheable::Uncacheable(NoCacheReason::Custom("local-ttl-overflow")),
+			false,
+			true,
+		);
+	};
+	let origin_deadline = meta.fresh_until();
+	let bounded_deadline = origin_deadline.min(local_deadline);
+	if bounded_deadline <= admitted_at {
+		return (
+			RespCacheable::Uncacheable(NoCacheReason::Custom("freshness-expired")),
+			false,
+			false,
+		);
+	}
+	let ttl_was_capped = origin_deadline > local_deadline;
+	let bounded = CacheMeta::new(
+		bounded_deadline,
+		admitted_at,
+		0,
+		0,
+		meta.response_header_copy(),
+	);
+	(RespCacheable::Cacheable(bounded), ttl_was_capped, false)
+}
+
+fn strip_cache_status_header(response: &mut ResponseHeader) {
+	response.remove_header("X-Proxy-Cache");
 }
 
 fn cache_status_header(cache: &HttpCache) -> &'static str {
@@ -1538,6 +1865,7 @@ where
 pub struct Proxy{
 	request_counter: AtomicUsize,
 	cache: Arc<IsolationStore>,
+	cache_policy: CachePolicy,
 	metrics: Arc<CircuitMetrics>,
 	authentication: Option<AuthenticatedIngressRuntime>,
 	//isolation_manager: IsolationHelper,
@@ -1554,6 +1882,7 @@ pub struct RequestCtx{
 	isolation_identity: String,
 	isolation_group_key: u64,
 	strict_isolation: bool,
+	cache_scope: Option<OpaqueCacheScope>,
 	request_started: tokio::time::Instant,
 	cache_started: Option<tokio::time::Instant>,
 	cache_lock_recorded: bool,
@@ -1652,6 +1981,13 @@ struct CircuitMetrics {
 	cache_stale_hits: AtomicU64,
 	cache_bypasses: AtomicU64,
 	cache_insertions: AtomicU64,
+	cache_bypass_strict: AtomicU64,
+	cache_bypass_unauthenticated: AtomicU64,
+	cache_bypass_origin_not_allowed: AtomicU64,
+	cache_bypass_request_policy: AtomicU64,
+	cache_bypass_response_policy: AtomicU64,
+	cache_ttl_caps: AtomicU64,
+	cache_metadata_failures: AtomicU64,
 	upstream_reused: AtomicU64,
 	upstream_fresh: AtomicU64,
 	bridge_tasks_active: AtomicUsize,
@@ -2094,11 +2430,18 @@ fn render_prometheus_metrics(
 	metric!("proxy_bytes_from_tor_total", "Payload bytes received from Tor.", "counter", metrics.bytes_from_tor.load(Ordering::Relaxed));
 	metric!("proxy_customer_data_limit_rejections_total", "Requests or active tunnels stopped by the account-wide period data limit.", "counter", metrics.customer_data_limit_rejections.load(Ordering::Relaxed));
 	metric!("proxy_account_usage_checkpoint_failures_total", "Active-tunnel usage checkpoints that failed closed.", "counter", metrics.account_usage_checkpoint_failures.load(Ordering::Relaxed));
-	metric!("proxy_cache_hits_total", "Fresh shared-cache hits.", "counter", metrics.cache_hits.load(Ordering::Relaxed));
-	metric!("proxy_cache_misses_total", "Shared-cache misses.", "counter", metrics.cache_misses.load(Ordering::Relaxed));
-	metric!("proxy_cache_stale_hits_total", "Stale shared-cache hits.", "counter", metrics.cache_stale_hits.load(Ordering::Relaxed));
-	metric!("proxy_cache_bypasses_total", "Requests bypassing shared cache.", "counter", metrics.cache_bypasses.load(Ordering::Relaxed));
-	metric!("proxy_cache_insertions_total", "Responses accepted by cache admission policy.", "counter", metrics.cache_insertions.load(Ordering::Relaxed));
+	metric!("proxy_cache_hits_total", "Fresh tenant-scoped cache hits.", "counter", metrics.cache_hits.load(Ordering::Relaxed));
+	metric!("proxy_cache_misses_total", "Tenant-scoped cache misses.", "counter", metrics.cache_misses.load(Ordering::Relaxed));
+	metric!("proxy_cache_stale_hits_total", "Unexpected stale tenant-scoped cache hits.", "counter", metrics.cache_stale_hits.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypasses_total", "Requests bypassing the tenant-scoped cache.", "counter", metrics.cache_bypasses.load(Ordering::Relaxed));
+	metric!("proxy_cache_insertions_total", "Responses accepted by the tenant-scoped cache admission policy.", "counter", metrics.cache_insertions.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypass_strict_total", "Cache bypasses required by strict isolation.", "counter", metrics.cache_bypass_strict.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypass_unauthenticated_total", "Cache bypasses without a trusted authenticated scope.", "counter", metrics.cache_bypass_unauthenticated.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypass_origin_not_allowed_total", "Cache bypasses for origins outside the exact local allowlist.", "counter", metrics.cache_bypass_origin_not_allowed.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypass_request_policy_total", "Cache bypasses required by request semantics.", "counter", metrics.cache_bypass_request_policy.load(Ordering::Relaxed));
+	metric!("proxy_cache_bypass_response_policy_total", "Responses rejected by cache admission policy.", "counter", metrics.cache_bypass_response_policy.load(Ordering::Relaxed));
+	metric!("proxy_cache_ttl_caps_total", "Cached responses whose freshness was reduced by the local TTL ceiling.", "counter", metrics.cache_ttl_caps.load(Ordering::Relaxed));
+	metric!("proxy_cache_metadata_failures_total", "Cache metadata construction failures that failed safely.", "counter", metrics.cache_metadata_failures.load(Ordering::Relaxed));
 	metric!("proxy_cache_entries", "Assets tracked by cache eviction.", "gauge", cache_eviction().total_items());
 	metric!("proxy_cache_bytes", "Bytes tracked by cache eviction.", "gauge", cache_eviction().total_size());
 	metric!("proxy_cache_evictions_total", "Assets evicted by the LRU manager.", "counter", cache_eviction().evicted_items());
@@ -2810,6 +3153,30 @@ impl Proxy {
 			.map(|val| val.to_string())
             .ok_or("Error: No ID found".to_string())
     }
+
+	fn record_cache_access_decision(&self, decision: &CacheAccessDecision) {
+		match decision {
+			CacheAccessDecision::Eligible { .. } => {}
+			CacheAccessDecision::BypassStrict => {
+				self.metrics.cache_bypass_strict.fetch_add(1, Ordering::Relaxed);
+			}
+			CacheAccessDecision::BypassUnauthenticated => {
+				self.metrics
+					.cache_bypass_unauthenticated
+					.fetch_add(1, Ordering::Relaxed);
+			}
+			CacheAccessDecision::BypassOriginNotAllowed => {
+				self.metrics
+					.cache_bypass_origin_not_allowed
+					.fetch_add(1, Ordering::Relaxed);
+			}
+			CacheAccessDecision::BypassRequestPolicy => {
+				self.metrics
+					.cache_bypass_request_policy
+					.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+	}
 }
 
 //trait TorStack {
@@ -2857,6 +3224,7 @@ impl ProxyHttp for Proxy {
 			isolation_identity: String::new(),
 			isolation_group_key: 0,
 			strict_isolation: false,
+			cache_scope: None,
 			request_started: tokio::time::Instant::now(),
 			cache_started: None,
 			cache_lock_recorded: false,
@@ -2993,6 +3361,19 @@ impl ProxyHttp for Proxy {
 		};
 		ctx.token = material.token;
 		ctx.isolation_group_key = material.group_key;
+		ctx.cache_scope = if ctx.strict_isolation {
+			None
+		} else if let (Some(authentication), Some(identity)) =
+			(&self.authentication, ctx.ingress_identity)
+		{
+			Some(authentication.isolation_hasher.cache_scope(
+				identity,
+				&ctx.isolation_identity,
+				ctx.isolation_group_key,
+			))
+		} else {
+			None
+		};
 		if ctx.strict_isolation {
 			session.as_downstream_mut().set_keepalive(None);
 		}
@@ -3009,7 +3390,9 @@ impl ProxyHttp for Proxy {
 			canonical_cache_key_parts(request)
 				.map_err(|error| Error::because(InvalidHTTPHeader, "invalid cache authority", error))?;
 		}
-		if request_cache_eligible(request) {
+		let decision = cache_access_decision(request, ctx, &self.cache_policy);
+		self.record_cache_access_decision(&decision);
+		if matches!(decision, CacheAccessDecision::Eligible { .. }) {
 			ctx.cache_started = Some(tokio::time::Instant::now());
             session.cache.enable(
                 cache(),
@@ -3026,25 +3409,54 @@ impl ProxyHttp for Proxy {
 	fn cache_key_callback(
 		&self, 
 		session: &Session,
-		_ctx: &mut Self::CTX
+		ctx: &mut Self::CTX
 	) -> Result<CacheKey> {
-		let (authority_namespace, path_and_query) = canonical_cache_key_parts(session.req_header())
-			.map_err(|error| Error::because(InvalidHTTPHeader, "invalid cache authority", error))?;
-		Ok(CacheKey::new(authority_namespace, path_and_query, ""))
+		let scope = match cache_access_decision(session.req_header(), ctx, &self.cache_policy) {
+			CacheAccessDecision::Eligible { scope, .. } => scope,
+			_ => {
+				return Err(Error::explain(
+					InternalError,
+					"cache key callback invoked without an eligible trusted scope",
+				));
+			}
+		};
+		scoped_cache_key(session.req_header(), &scope)
+			.map_err(|error| Error::because(InvalidHTTPHeader, "invalid cache authority", error))
 	}
 
 	fn response_cache_filter(
 		&self,
 		session: &Session,
 		upstream_response: &ResponseHeader,
-		_ctx: &mut Self::CTX,
+		ctx: &mut Self::CTX,
 	) -> Result<RespCacheable> {
-		let cacheable = conservative_response_cacheable(
+		if !matches!(
+			cache_access_decision(session.req_header(), ctx, &self.cache_policy),
+			CacheAccessDecision::Eligible { .. }
+		) {
+			return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+				"cache-access-policy",
+			)));
+		}
+		let (cacheable, ttl_was_capped, metadata_failed) = bounded_response_cacheable(
 			session.req_header(),
 			upstream_response,
+			self.cache_policy.effective_max_ttl(),
 		);
+		if ttl_was_capped {
+			self.metrics.cache_ttl_caps.fetch_add(1, Ordering::Relaxed);
+		}
+		if metadata_failed {
+			self.metrics
+				.cache_metadata_failures
+				.fetch_add(1, Ordering::Relaxed);
+		}
 		if cacheable.is_cacheable() {
 			self.metrics.cache_insertions.fetch_add(1, Ordering::Relaxed);
+		} else {
+			self.metrics
+				.cache_bypass_response_policy
+				.fetch_add(1, Ordering::Relaxed);
 		}
 		Ok(cacheable)
 	}
@@ -3065,11 +3477,11 @@ impl ProxyHttp for Proxy {
 	
 	async fn response_filter(
 		&self,
-		session: &mut Session,
+		_session: &mut Session,
 		upstream_response: &mut ResponseHeader,
 		ctx: &mut Self::CTX,
 	) -> Result<(), Box<Error>> {
-		upstream_response.insert_header("X-Proxy-Cache", cache_status_header(&session.cache))?;
+		strip_cache_status_header(upstream_response);
 		match Self::extract_id(ctx.id) {
             Ok(id_string) => {
                 match upstream_response.insert_header("Server-Response-ID", id_string) {
@@ -4044,6 +4456,18 @@ fn main() -> Result<()> {
 		}
 	};
 	let authentication = public_ingress.authentication();
+	let cache_policy = match CachePolicy::from_environment(authentication.is_some()) {
+		Ok(policy) => policy,
+		Err(error) => {
+			eprintln!("{error}");
+			process::exit(1);
+		}
+	};
+	eprintln!(
+		"{{\"event\":\"cache_policy_loaded\",\"allowed_origin_count\":{},\"max_ttl_seconds\":{}}}",
+		cache_policy.allowed_http_origins.len(),
+		cache_policy.effective_max_ttl().as_secs(),
+	);
 	let bridge_drain_config = match BridgeTaskDrainConfig::from_environment() {
 		Ok(configuration) => configuration,
 		Err(error) => {
@@ -4093,6 +4517,7 @@ fn main() -> Result<()> {
 	let mut service = ProxyServiceBuilder::new(&server.configuration, Proxy {
 		request_counter: 0.into(), 
 		cache: token_store.clone(),
+		cache_policy,
 		metrics,
 		authentication,
 		//isolation_manager: IsolationHelper::new() ### Error, no constructors for traits
@@ -4109,18 +4534,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		acquire_active_tunnel_permit, acquire_circuit_permit, canonical_cache_key_parts,
-		canonical_connect_destination_key, conservative_response_cacheable, connect_destination_allowed,
+		acquire_active_tunnel_permit, acquire_circuit_permit, bounded_response_cacheable,
+		cache_access_decision, canonical_cache_key_parts, canonical_connect_destination_key,
+		conservative_response_cacheable, connect_destination_allowed,
 		copy_bidirectional_with_idle_timeout, copy_bidirectional_with_idle_timeout_and_counters,
 		copy_one_direction, copy_one_direction_with_customer_data,
 		parse_connect_destination, parse_connect_request, parse_proxy_request, read_proxy_request,
 		proxy_server_configuration, render_prometheus_metrics, request_cache_eligible, resolve_isolation,
-		serve_prometheus_connection, strip_ingress_headers, take_isolation_request,
+		scoped_cache_key, serve_prometheus_connection, strip_cache_status_header,
+		strip_ingress_headers, take_isolation_request,
 		AccountRequestScope, AuthenticatedDownstreamStore, AuthenticatedRequestContext,
 		BridgeIdentityRegistry, BridgeShutdown, BridgeTaskDrainConfig, BridgeTaskKind,
-		BridgeTaskRegistry, CircuitBreaker, CircuitMetrics, ConnectFailure,
+		BridgeTaskRegistry, CacheAccessDecision, CachePolicy, CircuitBreaker, CircuitMetrics, ConnectFailure,
 		CustomerDataAdmissionError, CustomerDataDirection, CustomerDataLimiter, IsolationRequest,
-		IsolationStore, SingleTierPolicy, TenantIsolationHasher, PUBLIC_PROXY_ADDR,
+		IsolationStore, OpaqueCacheScope, RequestCtx, SingleTierPolicy, TenantIsolationHasher,
+		CACHE_ABSOLUTE_MAX_TTL, CACHE_KEY_NAMESPACE_VERSION, PUBLIC_PROXY_ADDR,
 		GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, SHUTDOWN_GRACE_MARGIN_SECONDS,
 	};
 	use super::account_management::{
@@ -4138,7 +4566,7 @@ mod tests {
 		pin::Pin,
 		task::{Context, Poll},
 	};
-	use std::time::Instant as StdInstant;
+	use std::time::{Instant as StdInstant, SystemTime};
 	use zeroize::Zeroizing;
 	use tokio::{
 		io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -4245,6 +4673,24 @@ mod tests {
 			.insert_header(http::header::CACHE_CONTROL, cache_control)
 			.unwrap();
 		response
+	}
+
+	fn cache_test_context(scope: Option<&str>, strict: bool) -> RequestCtx {
+		RequestCtx {
+			id: None,
+			account_id: None,
+			ingress_identity: None,
+			usage_period_start: None,
+			bridge_identity_lease: None,
+			token: arti_client::IsolationToken::new(),
+			isolation_identity: "test-isolation".to_owned(),
+			isolation_group_key: 1,
+			strict_isolation: strict,
+			cache_scope: scope.map(|scope| OpaqueCacheScope(scope.to_owned())),
+			request_started: tokio::time::Instant::now(),
+			cache_started: None,
+			cache_lock_recorded: false,
+		}
 	}
 
 	fn provision_test_identity(
@@ -4848,6 +5294,28 @@ mod tests {
 		.unwrap();
 		let first = provision_test_identity(&manager, "first-scope@example.com", 0x31);
 		let second = provision_test_identity(&manager, "second-scope@example.com", 0x32);
+		let now = UnixTimestamp::new(101).unwrap();
+		let other_workspace = manager
+			.create_workspace(first.account_id(), "other-workspace", now)
+			.unwrap();
+		let other_workspace_key = manager
+			.issue_api_key(first.account_id(), other_workspace.id(), "other-workspace", now)
+			.unwrap();
+		let other_workspace_fingerprint = CertificateFingerprint::from_sha256([0x33; 32]);
+		manager
+			.register_device_credential(
+				first.account_id(),
+				other_workspace.id(),
+				&other_workspace_fingerprint,
+				"other workspace device",
+				now,
+			)
+			.unwrap();
+		let same_account_other_workspace = authenticate_test_identity(
+			&manager,
+			&other_workspace_key,
+			&other_workspace_fingerprint,
+		);
 		let hasher = TenantIsolationHasher::new().unwrap();
 		let request = || IsolationRequest {
 			identity: Some("browser".to_owned()),
@@ -4856,11 +5324,41 @@ mod tests {
 		let first_key = hasher.resolve(first, "example.com:443", request());
 		let first_again = hasher.resolve(first, "example.com:443", request());
 		let other_account = hasher.resolve(second, "example.com:443", request());
+		let other_workspace =
+			hasher.resolve(same_account_other_workspace, "example.com:443", request());
 		let other_destination = hasher.resolve(first, "other.example:443", request());
+		let other_subdivision = hasher.resolve(
+			first,
+			"example.com:443",
+			IsolationRequest {
+				identity: Some("other-browser".to_owned()),
+				strict: false,
+			},
+		);
 		assert_eq!(first_key.identity, first_again.identity);
 		assert_ne!(first_key.identity, other_account.identity);
+		assert_ne!(first_key.identity, other_workspace.identity);
 		assert_ne!(first_key.identity, other_destination.identity);
 		assert_eq!(first_key.identity.len(), 64);
+
+		let cache_scope = hasher.cache_scope(first, &first_key.identity, 10);
+		let same_cache_scope = hasher.cache_scope(first, &first_again.identity, 10);
+		let other_account_cache_scope = hasher.cache_scope(second, &other_account.identity, 10);
+		let other_workspace_cache_scope = hasher.cache_scope(
+			same_account_other_workspace,
+			&other_workspace.identity,
+			10,
+		);
+		let other_subdivision_cache_scope =
+			hasher.cache_scope(first, &other_subdivision.identity, 10);
+		let rotated_cache_scope = hasher.cache_scope(first, &first_key.identity, 11);
+		assert_eq!(cache_scope, same_cache_scope);
+		assert_ne!(cache_scope, other_account_cache_scope);
+		assert_ne!(cache_scope, other_workspace_cache_scope);
+		assert_ne!(cache_scope, other_subdivision_cache_scope);
+		assert_ne!(cache_scope, rotated_cache_scope);
+		assert!(!cache_scope.as_str().contains("browser"));
+		assert_eq!(cache_scope.as_str().len(), 64);
 
 		let period_start = UnixTimestamp::new(1_700_000_000).unwrap();
 		let scope = AccountRequestScope {
@@ -4904,6 +5402,18 @@ mod tests {
 		assert_eq!(first, same);
 		assert_ne!(first.token, different.token);
 		assert_ne!(first.group_key, different.group_key);
+	}
+
+	#[test]
+	fn isolation_rotation_changes_token_and_cache_generation() {
+		let store = IsolationStore::new(8, Duration::from_secs(60));
+		let first = store.material_for("session-a");
+		let rotated = store.rotate("session-a");
+		let current = store.material_for("session-a");
+
+		assert_ne!(first.token, rotated.token);
+		assert_ne!(first.group_key, rotated.group_key);
+		assert_eq!(rotated, current);
 	}
 
 	#[test]
@@ -5200,6 +5710,8 @@ mod tests {
 		let metrics = CircuitMetrics::default();
 		metrics.record_request("GET", 200, Duration::from_millis(25));
 		metrics.cache_hits.store(2, Ordering::Relaxed);
+		metrics.cache_bypass_strict.store(1, Ordering::Relaxed);
+		metrics.cache_ttl_caps.store(3, Ordering::Relaxed);
 		metrics.bytes_to_tor.store(123, Ordering::Relaxed);
 		metrics.customer_data_limit_rejections.store(3, Ordering::Relaxed);
 		metrics.account_usage_checkpoint_failures.store(1, Ordering::Relaxed);
@@ -5215,6 +5727,8 @@ mod tests {
 
 		assert!(rendered.contains("proxy_requests_total{method=\"GET\",status=\"200\"} 1"));
 		assert!(rendered.contains("proxy_cache_hits_total 2"));
+		assert!(rendered.contains("proxy_cache_bypass_strict_total 1"));
+		assert!(rendered.contains("proxy_cache_ttl_caps_total 3"));
 		assert!(rendered.contains("proxy_bytes_to_tor_total 123"));
 		assert!(rendered.contains("proxy_customer_data_limit_rejections_total 3"));
 		assert!(rendered.contains("proxy_account_usage_checkpoint_failures_total 1"));
@@ -5294,12 +5808,10 @@ mod tests {
 			&https_url,
 			&["X-Proxy-Isolation: verification-session", "X-Proxy-Isolation-Mode: strict"],
 		);
-		run(&cacheable_url, &[]);
+		let first_cache_response = run(&cacheable_url, &[]).to_ascii_lowercase();
 		let second_cache_response = run(&cacheable_url, &[]).to_ascii_lowercase();
-		assert!(
-			second_cache_response.contains("x-proxy-cache: hit"),
-			"the second controlled cacheable request was not a verified cache hit"
-		);
+		assert!(!first_cache_response.contains("x-proxy-cache:"));
+		assert!(!second_cache_response.contains("x-proxy-cache:"));
 	}
 
 	#[test]
@@ -5401,6 +5913,100 @@ mod tests {
 	}
 
 	#[test]
+	fn cache_policy_requires_reviewed_exact_public_http_origins() {
+		assert!(CachePolicy::parse(None, None, true).is_err());
+		assert!(CachePolicy::parse(Some(""), None, true).is_err());
+		assert!(CachePolicy::parse(None, None, false).unwrap().allowed_http_origins.is_empty());
+
+		let policy = CachePolicy::parse(
+			Some("HTTP://Example.COM,http://example.com:80,http://other.example:8080"),
+			Some("60"),
+			true,
+		)
+		.unwrap();
+		assert_eq!(policy.allowed_http_origins.len(), 2);
+		assert!(policy.allows("http://example.com:80"));
+		assert!(policy.allows("http://other.example:8080"));
+		assert!(!policy.allows("http://sub.example.com:80"));
+		assert!(!policy.allows("http://attacker-example.com:80"));
+
+		for invalid in [
+			"*", "all", "http://*.example.com", "https://example.com",
+			"http://user@example.com", "http://example.com/", "http://example.com?query",
+			"http://example.com#fragment", "http://localhost", "http://127.0.0.1",
+			"http://127.1", "http://192.168.1.10", "http://[::1]",
+			"http://[::ffff:8.8.8.8]", "http://example..com", "http://-example.com",
+			"http://example-.com",
+		] {
+			assert!(
+				CachePolicy::parse(Some(invalid), None, true).is_err(),
+				"unexpectedly accepted {invalid}",
+			);
+		}
+		assert!(CachePolicy::parse(Some("http://example.com"), Some("0"), true).is_err());
+		assert!(CachePolicy::parse(Some("http://example.com"), Some("301"), true).is_err());
+		assert_eq!(
+			CachePolicy::parse(Some("http://example.com"), Some("300"), true)
+				.unwrap()
+				.effective_max_ttl(),
+			CACHE_ABSOLUTE_MAX_TTL,
+		);
+	}
+
+	#[test]
+	fn cache_access_requires_non_strict_authenticated_scope_and_exact_origin() {
+		let policy = CachePolicy::parse(Some("http://example.com"), None, true).unwrap();
+		let request = cache_request("GET", "http://example.com/item", "example.com");
+		let strict = cache_test_context(Some("opaque"), true);
+		let unauthenticated = cache_test_context(None, false);
+		let eligible = cache_test_context(Some("opaque"), false);
+
+		assert_eq!(
+			cache_access_decision(&request, &strict, &policy),
+			CacheAccessDecision::BypassStrict,
+		);
+		assert_eq!(
+			cache_access_decision(&request, &unauthenticated, &policy),
+			CacheAccessDecision::BypassUnauthenticated,
+		);
+		assert!(matches!(
+			cache_access_decision(&request, &eligible, &policy),
+			CacheAccessDecision::Eligible {
+				canonical_origin,
+				..
+			} if canonical_origin == "http://example.com:80"
+		));
+
+		let subdomain = cache_request("GET", "http://sub.example.com/item", "sub.example.com");
+		assert_eq!(
+			cache_access_decision(&subdomain, &eligible, &policy),
+			CacheAccessDecision::BypassOriginNotAllowed,
+		);
+		let mut personalized = request.clone();
+		personalized.insert_header(http::header::COOKIE, "session=secret").unwrap();
+		assert_eq!(
+			cache_access_decision(&personalized, &eligible, &policy),
+			CacheAccessDecision::BypassRequestPolicy,
+		);
+	}
+
+	#[test]
+	fn scoped_cache_keys_version_and_partition_storage_and_locks() {
+		let request = cache_request("GET", "http://example.com/item?q=1", "example.com");
+		let first_scope = OpaqueCacheScope("opaque-scope-a".to_owned());
+		let second_scope = OpaqueCacheScope("opaque-scope-b".to_owned());
+		let first = scoped_cache_key(&request, &first_scope).unwrap();
+		let same = scoped_cache_key(&request, &first_scope).unwrap();
+		let second = scoped_cache_key(&request, &second_scope).unwrap();
+
+		assert!(first.namespace().starts_with(CACHE_KEY_NAMESPACE_VERSION.as_bytes()));
+		assert_eq!(first.to_compact(), same.to_compact());
+		assert_ne!(first.to_compact(), second.to_compact());
+		assert_eq!(first.user_tag, "opaque-scope-a");
+		assert!(!format!("{first:?}").contains("X-Proxy-Isolation"));
+	}
+
+	#[test]
 	fn cache_policy_requires_explicit_public_freshness() {
 		let request = cache_request("GET", "http://example.com/item", "example.com");
 		let public = cache_response("public, max-age=60");
@@ -5433,6 +6039,42 @@ mod tests {
 		let ordinary = cache_request("GET", "http://example.com/item", "example.com");
 		assert!(!conservative_response_cacheable(&ordinary, &set_cookie).is_cacheable());
 		assert!(!conservative_response_cacheable(&ordinary, &vary).is_cacheable());
+	}
+
+	#[test]
+	fn cache_metadata_is_time_bounded_and_never_serveable_stale() {
+		let request = cache_request("GET", "http://example.com/item", "example.com");
+		let poisoned = cache_response(
+			"public, max-age=4294967295, stale-while-revalidate=4294967295, stale-if-error=4294967295",
+		);
+		let before = SystemTime::now();
+		let (cacheable, capped, metadata_failed) =
+			bounded_response_cacheable(&request, &poisoned, Duration::from_secs(60));
+		let meta = match cacheable {
+			pingora::cache::RespCacheable::Cacheable(meta) => meta,
+			pingora::cache::RespCacheable::Uncacheable(reason) => {
+				panic!("expected bounded cache metadata, received {reason:?}")
+			}
+		};
+
+		assert!(capped);
+		assert!(!metadata_failed);
+		assert!(meta.fresh_until() <= before + Duration::from_secs(61));
+		assert!(meta.fresh_sec() <= 60);
+		assert_eq!(meta.stale_while_revalidate_sec(), 0);
+		assert_eq!(meta.stale_if_error_sec(), 0);
+		assert!(!meta.serve_stale_while_revalidate(meta.fresh_until() + Duration::from_secs(1)));
+		assert!(!meta.serve_stale_if_error(meta.fresh_until() + Duration::from_secs(1)));
+	}
+
+	#[test]
+	fn cache_status_is_removed_even_when_injected_by_the_origin() {
+		let mut response = cache_response("public, max-age=60");
+		response.insert_header("X-Proxy-Cache", "HIT").unwrap();
+
+		strip_cache_status_header(&mut response);
+
+		assert!(!response.headers.contains_key("X-Proxy-Cache"));
 	}
 
 	#[test]

@@ -97,6 +97,7 @@ result_dir="$test_tmpdir/results"
 proxy_log="$test_tmpdir/proxy.log"
 mkdir -p "$result_dir"
 proxy_pid=""
+request_pids=()
 
 cleanup() {
 	if [[ -n "$proxy_pid" ]] && kill -0 "$proxy_pid" 2>/dev/null; then
@@ -133,6 +134,23 @@ wait_for_proxy() {
 	echo "error: proxy did not listen on 127.0.0.1:8080 within ${startup_timeout_seconds}s" >&2
 	show_proxy_log
 	exit 1
+}
+
+wait_for_request_batch() {
+	local request_pid
+	local batch_failed=0
+
+	for request_pid in "${request_pids[@]}"; do
+		if ! wait "$request_pid"; then
+			batch_failed=1
+		fi
+	done
+	request_pids=()
+
+	if (( batch_failed )); then
+		echo "error: a stress-test request worker exited without recording a result" >&2
+		return 1
+	fi
 }
 
 if (( run_scheduler_tests )); then
@@ -174,12 +192,13 @@ for ((request_id = 1; request_id <= requests; request_id++)); do
 		curl_status=$?
 		printf '%s %s\n' "$curl_status" "${http_code:-000}" >"$result_dir/$request_id.status"
 	) &
+	request_pids+=("$!")
 
-	if (( request_id % concurrency == 0 )); then
-		wait
+	if (( ${#request_pids[@]} == concurrency )); then
+		wait_for_request_batch
 	fi
 done
-wait
+wait_for_request_batch
 
 elapsed_seconds=$((SECONDS - started_at))
 completed="$(awk 'END { print NR + 0 }' "$result_dir"/*.status)"

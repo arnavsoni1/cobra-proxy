@@ -62,6 +62,16 @@ Do not decrypt or cache tunneled HTTPS. TLS must remain end-to-end between the c
 
 ## Phase 2: Activate the HTTP Cache Safely
 
+> **Superseded security guidance:** The shared-cache key and downstream
+> `X-Proxy-Cache` recommendations in this phase predate authenticated
+> account/workspace isolation. The implemented contract is now the v2 opaque
+> tenant/workspace/isolation-generation scope, exact HTTP-origin allowlist,
+> local 60-second default and 300-second absolute TTL ceilings, disabled stale
+> service, and removal of downstream cache-status headers described in
+> `docs/plans/cache/cache-isolation-and-exit-poisoning-fix-plan.md`. The request
+> and response admission checks, object-size bound, LRU, and cache lock below
+> remain applicable where they do not conflict with that contract.
+
 The proxy enables cache lookup for GET requests, but Pingora will not admit responses until `response_cache_filter` returns a cacheable `CacheMeta`.
 
 ### Cache admission policy

@@ -132,6 +132,7 @@ Required production settings:
 | `PROXY_ACCOUNT_DATABASE` | Owner-only SQLite account/credential/usage database |
 | `PROXY_API_KEY_HASH_KEY_FILE` | Owner-only regular file containing exactly 32 random bytes |
 | `PROXY_SINGLE_TIER_PERIOD_BYTE_LIMIT` | Combined upload and download bytes allowed to one account in each usage period |
+| `PROXY_CACHE_ALLOWED_HTTP_ORIGINS` | Non-empty comma-separated exact `http://host:port` origins reviewed for plaintext caching; wildcards and local/private literals are rejected |
 
 Optional positive integer settings:
 
@@ -144,6 +145,7 @@ Optional positive integer settings:
 | `PROXY_MAX_CACHED_ACCOUNTS` | `1024` | Bounded in-memory account admission states |
 | `PROXY_USAGE_PERIOD_SECONDS` | `2592000` | Epoch-aligned usage/quota period |
 | `PROXY_CERT_TRUST_OVERLAP_SECONDS` | `86400` | Planned client-CA rotation overlap |
+| `PROXY_CACHE_MAX_TTL_SECONDS` | `60` | Local cache freshness ceiling; values above the compiled 300-second maximum are rejected |
 
 Generate the API-key hash secret without placing it in an environment variable:
 
@@ -259,7 +261,11 @@ An HTTP response produced by the destination is passed through as an origin resp
 
 Only ordinary HTTP is eligible for caching. HTTPS tunnels are opaque and never cached.
 
-The cache is an in-memory, process-local shared cache with a bounded size, per-object size limit, sharded LRU eviction, and a cache lock to avoid duplicate cold fetches. The cache key includes scheme, normalized host, effective port, path, and query. A disagreement between an absolute request URI and the `Host` header is rejected.
+The cache is an in-memory, process-local physical cache with a bounded size, per-object size limit, sharded LRU eviction, and a cache lock to avoid duplicate cold fetches. Production cache access requires successful authentication and a non-strict request. Development ingress and strict-isolation requests bypass lookup, locking, stale service, and insertion.
+
+Each logical key uses a v2 namespace and a keyed opaque scope derived from the authenticated account, workspace, resolved isolation subdivision, and current isolation/upstream generation. The URL portion includes scheme, normalized host, effective port, path, and query. A disagreement between an absolute request URI and the `Host` header is rejected. Because Pingora includes the opaque user tag in its compact key, storage and cold-fetch locks are partitioned by the same boundary.
+
+Only exact origins listed in `PROXY_CACHE_ALLOWED_HTTP_ORIGINS` may use the cache. Configuration is validated once at startup: no wildcard, userinfo, path, query, fragment, non-HTTP scheme, or local/private/special-purpose literal is accepted. The allowlist limits amplification risk; it does not make plaintext HTTP authentic against a malicious Tor exit.
 
 The admission policy is deliberately conservative. A response is cacheable only when all of the following are true:
 
@@ -268,8 +274,10 @@ The admission policy is deliberately conservative. A response is cacheable only 
 - The response contains no cookie-setting header.
 - The response does not use `Vary`.
 - The object fits within the configured size limit.
+- Origin freshness is capped by `PROXY_CACHE_MAX_TTL_SECONDS` and the compiled 300-second absolute maximum.
+- `stale-while-revalidate` and `stale-if-error` are disabled for stored plaintext responses.
 
-The shared cache can create cross-user timing signals even when it contains only explicitly public content. It should therefore be disabled by default for the strongest privacy offering, or partitioned by authenticated account and isolation policy. Disabling it also leaves the commercial service closer to a pure transmission service for legal classification purposes, although classification always remains jurisdiction- and fact-specific.
+The proxy never returns `X-Proxy-Cache`; an origin-supplied value is stripped as well. Cache results remain available only through aggregate, privacy-safe logs and Prometheus metrics. Timing can still distinguish hits from misses inside the same authorized scope, so the implementation does not claim to eliminate every cache side channel.
 
 ## Observability and data handling
 
@@ -360,12 +368,17 @@ To check a service already deployed on a VPS, run the framework on that host so 
   --metrics-url http://127.0.0.1:9090/metrics
 ```
 
-Caching requires an origin you control because a reliable assertion needs a known `Cache-Control: public, max-age=...` response. Enable that additional check with:
+Caching requires an authenticated running deployment and an origin you control because a reliable assertion needs a known `Cache-Control: public, max-age=...` response and a separate counter endpoint. Configure that exact origin in `PROXY_CACHE_ALLOWED_HTTP_ORIGINS`, place production proxy TLS and authentication options in an owner-only curl config, then run:
 
 ```bash
-./test-deployment.sh \
-  --cache-url http://your-authorized-test-origin.example/cacheable
+./test-deployment.sh --mode running \
+  --proxy-url https://proxy.example:8443 \
+  --proxy-curl-config /run/proxy/deployment-test.curlrc \
+  --cache-url http://your-authorized-test-origin.example/cacheable \
+  --cache-count-url https://your-authorized-test-origin.example/request-count
 ```
+
+The counter endpoint must return only the integer number of requests received by the cacheable endpoint and must not increment that count itself. The runner requires two identical response bodies, one origin fetch, an increase in `proxy_cache_hits_total`, and no downstream `X-Proxy-Cache` header.
 
 Use `./test-deployment.sh --help` for endpoint, timeout, artifact-directory, build-reuse, and keep-running options. The default external matrix sends only three functional requests: one Tor Check request plus one HTTPS and one plain-HTTP request to Example Domain. It is a functional verification, not a load test.
 

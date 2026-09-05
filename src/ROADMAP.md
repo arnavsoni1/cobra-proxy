@@ -21,6 +21,8 @@ Current detailed plans:
 
 - [Rustls private ingress](../docs/plans/ingress/rustls-private-ingress.md)
 - [Firewall egress hardening](../docs/plans/firewall/egress-hardening.md)
+- [Cache isolation and exit-poisoning fix](../docs/plans/cache/cache-isolation-and-exit-poisoning-fix-plan.md)
+- [Destination port and address policy fix](../docs/plans/destination/destination-port-and-address-policy-fix-plan.md)
 
 Current decisions and audits:
 
