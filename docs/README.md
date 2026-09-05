@@ -27,6 +27,9 @@ placeholder trees.
 - [Markdown implementation and conflict audit, 2026-08-09](audits/markdown-implementation-audit-2026-08-09.md)
   — implemented behavior, remaining work, and contradictions across every
   project-authored Markdown file.
+- [Egress hardening and Apple TUN overview audit, 2026-08-15](audits/egress-apple-tun-overview-audit-2026-08-15T18-12-39Z.md)
+  — server containment and Apple provider findings addressed by the implementation
+  guide below.
 
 ## Current decisions
 
@@ -42,6 +45,10 @@ placeholder trees.
 - [Firewall egress-hardening plan](plans/firewall/egress-hardening.md) —
   separate identities/processes, fail-closed Tor egress, network containment,
   and safe deployment verification.
+- [Egress and Apple TCP client implementation guide](plans/egress-apple-tun-implementation-guide.md)
+  — ordered implementation steps, architecture decisions, all 20 audit findings,
+  security gates, acceptance tests, and recovery requirements. Resolves conflicting
+  recommendations in the older egress plan for this proposed work.
 
 ## Document lifecycle
 
