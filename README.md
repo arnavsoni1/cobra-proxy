@@ -1,7 +1,6 @@
 # Private Circuit-Isolation Proxy
 
-> **Private and confidential**  
-> This repository and its documentation are not open source. Access does not grant permission to copy, redistribute, sublicense, publish, reverse engineer, or commercialize the original software. A signed agreement should govern access by contractors, partners, and customers.
+
 
 This project is a high-performance forward proxy that sends outbound traffic through the Tor network using Arti. Its defining feature is explicit circuit separation: traffic assigned to different isolation identities is prevented from sharing the same Tor circuit.
 
